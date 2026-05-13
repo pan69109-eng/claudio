@@ -14,11 +14,12 @@ function playAudio(audioPath) {
 
 async function speak(text) {
   try {
+    // 直接发送原始文本，让Fish Audio处理情感标签
     const audioData = await client.textToSpeech.convert({
       text,
       format: 'mp3',
-      prosody: { speed: 1.1 }
-    });
+      prosody: { speed: 1.0 }
+    }, 's2-pro');
 
     const tempDir = 'D:\\claude code的一些测试\\很难的啦\\claude-tts\\audio';
     const staticFile = path.join(tempDir, `tts_${Date.now()}.mp3`);

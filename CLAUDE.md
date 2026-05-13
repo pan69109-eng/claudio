@@ -14,6 +14,6 @@
 
 7\.代码尽可能简洁
 
-8.在回复完成后，自动执行node claude-tts/speak.js "（你的输出内容）" ，例如你输出了"你好123"，你就执行node claude-tts/speak.js "你好123" 
+
 
 

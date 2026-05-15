@@ -196,6 +196,94 @@ TTS 语音合成和播放功能正常。
 8.在回复完成后，自动执行node claude-tts/speak.js "（你的输出内容）" ，例如你输出了"你好123"，你就执行node claude-tts/speak.js "你好123"
 ```
 
+## 2026-05-14 更新
+
+### 后台播放问题
+
+**问题：** 使用 `SoundPlayer.PlaySync()` 会弹出系统对话框
+
+**解决方案：** 使用 `wmplayer` 播放器配合参数实现后台播放
+```powershell
+Start-Process -FilePath wmplayer -ArgumentList '音频路径','/Play','/Close'
+```
+- `/Play` - 开始播放
+- `/Close` - 播放完毕后自动关闭
+
+**注意：** wmplayer 后台播放测试中存在无声音问题，需进一步排查。
+
+### 稳定音色需求
+
+**需求：** 音乐电台播音员音色，要求每次生成使用相同的音色，不能有变化。
+
+**解决方案：**
+
+#### 方案1：参考音频克隆（推荐）
+Fish Audio SDK 支持通过 `references` 参数传入参考音频样本，实现音色克隆：
+
+```javascript
+const audioData = await client.textToSpeech.convert({
+  text,
+  format: 'mp3',
+  prosody: { speed: 1.0 },
+  references: [
+    {
+      audio: File,      // 参考音频文件（支持 mp3/wav/pcm/opus）
+      text: "参考音频对应的文本"  // 告诉模型这段音频说的是什么
+    }
+  ]
+}, 's2-pro');
+```
+
+**要求：** 提供约10秒的目标音色音频样本，即可克隆出完全一致的音色。
+
+#### 方案2：使用 reference_id
+1. 在 Fish Audio 平台上传参考音频
+2. 创建专属音色，获取 reference_id
+3. 通过 `reference_id` 直接调用该音色
+
+```javascript
+const audioData = await client.textToSpeech.convert({
+  text,
+  reference_id: 'your-voice-id'
+}, 's2-pro');
+```
+
+### SDK TTSRequest 接口（参考）
+
+```typescript
+export interface TTSRequest {
+  text: string;
+  temperature?: number;
+  top_p?: number;
+  references?: ReferenceAudio[];  // 参考音频列表
+  reference_id?: string;          // 已创建音色的ID
+  prosody?: {
+    speed?: number;
+    volume?: number;
+  };
+  chunk_length?: number;
+  normalize?: boolean;
+  format?: 'wav' | 'pcm' | 'mp3' | 'opus';
+  sample_rate?: number;
+  mp3_bitrate?: 64 | 128 | 192;
+  opus_bitrate?: -1000 | 24 | 32 | 48 | 64;
+  latency?: 'normal' | 'balanced';
+}
+
+export interface ReferenceAudio {
+  audio: File;
+  text: string;
+}
+```
+
+### 待完成
+
+1. 获取或录制一段播音员音色样本（约10秒）
+2. 测试 references 参数的音色克隆效果
+3. 解决 wmplayer 后台播放无声音问题
+
+---
+
 ## 总结
 
 项目从复杂的 Hook 方案演进为简单的主动调用方案，降低了实现难度，提高了稳定性。当前方案通过手动 Bash 调用实现 TTS 功能，支持 S2-Pro 模型的情感控制功能，可生成播音员风格的语音。

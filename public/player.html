@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Claudio Radio Player</title>
+  <script src="https://sdk.scdn.co/spotify-player.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1DB954 0%, #191414 100%);
+      color: white;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .player {
+      text-align: center;
+      padding: 40px;
+      background: rgba(0,0,0,0.6);
+      border-radius: 20px;
+      backdrop-filter: blur(10px);
+      max-width: 500px;
+      width: 90%;
+    }
+    h1 { color: #1DB954; margin-bottom: 10px; }
+    .status { margin: 15px 0; padding: 10px; border-radius: 10px; }
+    .status.ready { background: rgba(29, 185, 84, 0.2); }
+    .status.error { background: rgba(255, 85, 85, 0.2); color: #ff5555; }
+    .status.info { background: rgba(255, 255, 255, 0.1); }
+    #track-name { font-size: 24px; margin: 15px 0 5px; font-weight: bold; }
+    #artist { color: #ccc; margin-bottom: 15px; }
+    .album-art {
+      width: 200px;
+      height: 200px;
+      border-radius: 10px;
+      margin: 15px auto;
+      background: rgba(255,255,255,0.1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 48px;
+    }
+    .btn {
+      display: inline-block;
+      padding: 12px 25px;
+      background: #1DB954;
+      color: white;
+      text-decoration: none;
+      border-radius: 25px;
+      margin: 5px;
+      cursor: pointer;
+      border: none;
+      font-size: 14px;
+      transition: all 0.3s;
+    }
+    .btn:hover { background: #1ed760; transform: scale(1.05); }
+    .btn.secondary { background: rgba(255,255,255,0.2); }
+    .btn.secondary:hover { background: rgba(255,255,255,0.3); }
+    .controls { margin-top: 20px; }
+    .hidden { display: none; }
+    .login-link { color: #1DB954; text-decoration: none; }
+    .login-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="player">
+    <h1>Claudio Radio</h1>
+
+    <div id="auth-status" class="status info">检查登录状态...</div>
+
+    <div id="login-section" class="hidden">
+      <p>请先登录 Spotify</p>
+      <a href="/auth/login" class="btn">使用 Spotify 登录</a>
+      <p class="small" style="color:#888;margin-top:15px;">需要 Spotify Premium 账号</p>
+    </div>
+
+    <div id="player-section" class="hidden">
+      <div class="album-art" id="album-art">♪</div>
+      <div id="track-name">等待播放...</div>
+      <div id="artist"></div>
+
+      <div id="device-status" class="status info">正在连接设备...</div>
+
+      <div class="controls">
+        <button class="btn secondary" onclick="skipPrevious()">⏮</button>
+        <button class="btn" onclick="togglePlay()">⏯</button>
+        <button class="btn secondary" onclick="skipNext()">⏭</button>
+      </div>
+
+      <div style="margin-top:20px;">
+        <button class="btn secondary" onclick="logout()">退出登录</button>
+      </div>
+    </div>
+
+    <div id="error-section" class="hidden">
+      <div class="status error" id="error-message"></div>
+    </div>
+  </div>
+
+  <script>
+    let player = null;
+    let deviceId = null;
+    let currentToken = null;
+    let isPlaying = false;
+
+    // 检查登录状态
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/auth-status');
+        const data = await res.json();
+
+        document.getElementById('auth-status').classList.add('hidden');
+
+        if (data.loggedIn && data.tokenValid) {
+          document.getElementById('player-section').classList.remove('hidden');
+          initSpotifyPlayer();
+        } else {
+          document.getElementById('login-section').classList.remove('hidden');
+          document.getElementById('auth-status').textContent = '需要登录 Spotify';
+          document.getElementById('auth-status').classList.remove('hidden');
+        }
+      } catch (err) {
+        console.error('检查登录状态失败:', err);
+        document.getElementById('auth-status').textContent = '检查登录状态失败';
+      }
+    }
+
+    function initSpotifyPlayer() {
+      document.getElementById('device-status').textContent = '正在初始化播放器...';
+
+      window.onSpotifyWebPlaybackSDKReady = () => {
+        player = new Spotify.Player({
+          name: 'Claudio Radio',
+          getOAuthToken: (callback) => {
+            fetch('/api/token')
+              .then(res => res.json())
+              .then(data => {
+                currentToken = data.token;
+                callback(data.token);
+              })
+              .catch(err => {
+                console.error('获取token失败:', err);
+                callback(null);
+              });
+          },
+          volume: 0.5
+        });
+
+        player.addListener('initialization_error', ({ message }) => {
+          showError('初始化错误: ' + message);
+        });
+
+        player.addListener('authentication_error', ({ message }) => {
+          showError('认证错误: ' + message);
+          // 如果是token问题，重新登录
+          if (message.includes('token') || message.includes('scope')) {
+            setTimeout(() => logout(), 3000);
+          }
+        });
+
+        player.addListener('account_error', ({ message }) => {
+          showError('账户错误: ' + message + ' (需要Premium)');
+        });
+
+        player.addListener('playback_error', ({ message }) => {
+          showError('播放错误: ' + message);
+        });
+
+        player.addListener('ready', ({ device_id }) => {
+          deviceId = device_id;
+          document.getElementById('device-status').textContent = '✓ 设备已就绪';
+          document.getElementById('device-status').classList.remove('error');
+          document.getElementById('device-status').classList.add('ready');
+
+          // 通知后端设备已就绪
+          fetch('/api/device-ready', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceId })
+          });
+        });
+
+        player.addListener('not_ready', ({ device_id }) => {
+          document.getElementById('device-status').textContent = '设备离线: ' + device_id;
+          deviceId = null;
+        });
+
+        player.addListener('player_state_changed', (state) => {
+          if (state) {
+            const track = state.track_window.current_track;
+            document.getElementById('track-name').textContent = track.name;
+            document.getElementById('artist').textContent = track.artists.map(a => a.name).join(', ');
+            isPlaying = !state.paused;
+
+            // 获取专辑封面
+            if (track.album.images && track.album.images[0]) {
+              document.getElementById('album-art').innerHTML =
+                `<img src="${track.album.images[0].url}" style="width:100%;height:100%;object-fit:cover;border-radius:10px;">`;
+            }
+          }
+        });
+
+        player.connect();
+      };
+    }
+
+    function showError(message) {
+      document.getElementById('error-message').textContent = message;
+      document.getElementById('error-section').classList.remove('hidden');
+      document.getElementById('device-status').textContent = message;
+      document.getElementById('device-status').classList.add('error');
+    }
+
+    function togglePlay() {
+      if (player) {
+        player.togglePlay();
+      }
+    }
+
+    function skipNext() {
+      if (player) {
+        player.nextTrack();
+      }
+    }
+
+    function skipPrevious() {
+      if (player) {
+        player.previousTrack();
+      }
+    }
+
+    function logout() {
+      fetch('/auth/logout', { method: 'POST' })
+        .then(() => window.location.reload());
+    }
+
+    // 页面加载时检查登录
+    checkAuth();
+  </script>
+</body>
+</html>

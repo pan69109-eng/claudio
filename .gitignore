@@ -3,12 +3,19 @@ node_modules/
 
 # Environment
 .env
+.env.example
 
 # Audio files
 audio/*.mp3
 
 # Logs
 logs/*.log
+*.log
+server.err.log
+server.out.log
+
+# Database
+db/data.json
 
 # OS
 .DS_Store

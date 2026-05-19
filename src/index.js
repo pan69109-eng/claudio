@@ -2,22 +2,21 @@ import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { createServer } from 'http';
+import fs from 'fs';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { errorHandler } from './errorHandler.js';
-import { initDb, saveMessage, getMessages, savePlay, getRecentPlays } from './db.js';
+import { initDb, saveMessage, getMessages, savePlay, getRecentPlays, getNextTrack, getPreviousTrack, clearPlayHistory } from './db.js';
 import { route } from './router.js';
 import { buildContext } from './context.js';
 import { ask } from './claude.js';
-import { TTSPipeline } from './tts.js';
-import { searchTracks } from './spotify.js';
+import { searchTracks, getPlaylistTracks } from './spotify.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
 const server = createServer(app);
-const tts = new TTSPipeline();
 
 // 播放器状态
 let userAccessToken = null;
@@ -102,18 +101,14 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
-// 获取用户token（供Web Playback SDK使用）
-app.get('/api/token', (req, res) => {
-  if (!userAccessToken) {
-    return res.status(401).json({ error: '未登录' });
+// 获取用户token（供Web Playback SDK使用，支持自动刷新）
+app.get('/api/token', async (req, res) => {
+  try {
+    const token = await getUserToken();
+    res.json({ token });
+  } catch (err) {
+    res.status(401).json({ error: err.message });
   }
-
-  // 如果token快过期了，需要刷新
-  if (Date.now() >= userTokenExpiry) {
-    return res.status(401).json({ error: 'token过期，请重新登录' });
-  }
-
-  res.json({ token: userAccessToken });
 });
 
 // 检查登录状态
@@ -153,14 +148,12 @@ app.post('/api/play', async (req, res) => {
     if (!deviceId) {
       return res.status(400).json({ error: '播放器未就绪' });
     }
-    if (!userAccessToken) {
-      return res.status(401).json({ error: '未登录' });
-    }
 
+    const token = await getUserToken();
     const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
       method: 'PUT',
       headers: {
-        'Authorization': `Bearer ${userAccessToken}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({ uris: uri ? [uri] : [] })
@@ -188,83 +181,44 @@ app.post('/auth/logout', (req, res) => {
   res.json({ success: true });
 });
 
+// 播放命令API
+app.post('/api/command', async (req, res) => {
+  try {
+    const { command } = req.body;
+    if (!['play', 'pause', 'next', 'previous'].includes(command)) {
+      return res.status(400).json({ error: '未知命令' });
+    }
+    const result = await handleCommand({ command });
+    res.json(result);
+  } catch (err) {
+    logger.error('命令处理失败', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 播放历史API
+app.get('/api/history', (req, res) => {
+  const limit = parseInt(req.query.limit) || 20;
+  const history = getRecentPlays(limit);
+  res.json({ history });
+});
+
+// 清空播放历史
+app.delete('/api/history', (req, res) => {
+  clearPlayHistory();
+  res.json({ success: true });
+});
+
 // 聊天API
 app.post('/api/chat', async (req, res) => {
   try {
-    logger.info('API请求到达', { method: req.method, headers: req.headers['content-type'] });
     const { message } = req.body;
-    logger.info('解析消息', { message, bodyKeys: Object.keys(req.body || {}) });
     if (!message) {
       return res.status(400).json({ error: '消息不能为空' });
     }
 
-    logger.info('收到聊天消息', { message });
-
-    // 路由分发
-    const routed = route(message);
-    logger.info('路由分发结果', { type: routed.type, payload: routed.payload });
-
-    if (routed.type === 'music') {
-      const { intent, match } = routed.payload;
-      logger.info('进入music分支', { intent, match });
-      let tracks = [];
-      let speech = '';
-
-      if (intent === 'search' || intent === 'mood' || intent === 'playSearch') {
-        logger.info('开始搜索', { match });
-        tracks = await searchTracks(match);
-        logger.info('搜索完成', { trackCount: tracks.length });
-        speech = `为你搜索到${tracks.length}首相关歌曲`;
-      }
-
-      if (tracks.length > 0) {
-        savePlay(tracks[0]);
-        speech += `，现在播放：${tracks[0].name}，来自 ${tracks[0].artist}`;
-        logger.info('准备自动播放', { uri: tracks[0].uri, deviceId, hasToken: !!userAccessToken });
-
-        // 自动播放
-        if (tracks[0].uri && deviceId && userAccessToken) {
-          const playResponse = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
-            method: 'PUT',
-            headers: { 'Authorization': `Bearer ${userAccessToken}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ uris: [tracks[0].uri] })
-          });
-          logger.info('Spotify播放响应', { status: playResponse.status });
-        }
-
-        logger.info('返回结果', { speech, track: tracks[0].name });
-        res.json({
-          speech,
-          track: { name: tracks[0].name, artist: tracks[0].artist }
-        });
-      } else {
-        logger.info('没有找到歌曲');
-        res.json({ speech: '没有找到相关歌曲' });
-      }
-    } else if (routed.type === 'command') {
-      const { command } = routed.payload;
-      const messages = {
-        play: '开始播放音乐',
-        pause: '已暂停播放',
-        next: '切换到下一首',
-      };
-      const speech = messages[command] || '收到指令';
-      await tts.speak(speech);
-      res.json({ speech });
-    } else {
-      // LLM对话
-      const recentHistory = getRecentPlays(5);
-      const envContext = { time: new Date().toLocaleTimeString('zh-CN') };
-      const { systemPrompt } = buildContext(message, envContext, recentHistory);
-      const response = await ask(message, { systemPrompt });
-
-      let speech = response.speech || '';
-      if (response.should_speak !== false && speech) {
-        await tts.speak(speech);
-      }
-
-      res.json({ speech, response: JSON.stringify(response) });
-    }
+    const result = await handleInput(message);
+    res.json(result);
   } catch (err) {
     logger.error('聊天处理失败', { error: err.message });
     res.status(500).json({ error: err.message });
@@ -323,14 +277,93 @@ export async function handleInput(userInput) {
 
 async function handleCommand(payload) {
   const { command } = payload;
+  logger.info('handleCommand 开始', { command, deviceId });
+
   const messages = {
     play: '开始播放音乐',
     pause: '已暂停播放',
     next: '切换到下一首',
+    previous: '切换到上一首',
   };
-  const speech = messages[command] || '收到指令';
-  await tts.speak(speech);
-  return { command, speech };
+  let speech = messages[command] || '收到指令';
+  let track = null;
+
+  if (!deviceId) {
+    speech = '播放器设备还未就绪，请先等待 Spotify 连接完成';
+    logger.warn('设备未就绪', { command });
+    return { command, speech, code: 'DEVICE_NOT_READY' };
+  }
+
+  try {
+    const token = await getUserToken();
+
+    // 对于 next/previous，使用本地播放历史
+    if (command === 'next') {
+      track = getNextTrack();
+      if (track && track.uri) {
+        logger.info('播放下一首', { track: track.track_name, uri: track.uri });
+        const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+          method: 'PUT',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uris: [track.uri] })
+        });
+        if (response.ok) {
+          speech = `正在播放：${track.track_name} - ${track.artist}`;
+        } else {
+          speech = '切歌失败';
+        }
+      } else {
+        speech = '没有可播放的歌曲';
+      }
+    } else if (command === 'previous') {
+      track = getPreviousTrack();
+      if (track && track.uri) {
+        logger.info('播放上一首', { track: track.track_name, uri: track.uri });
+        const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+          method: 'PUT',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uris: [track.uri] })
+        });
+        if (response.ok) {
+          speech = `正在播放：${track.track_name} - ${track.artist}`;
+        } else {
+          speech = '切歌失败';
+        }
+      } else {
+        speech = '没有上一首歌曲';
+      }
+    } else {
+      // pause/play 继续使用 Spotify API
+      const endpoints = {
+        pause: { url: 'https://api.spotify.com/v1/me/player/pause', method: 'PUT' },
+        play: { url: 'https://api.spotify.com/v1/me/player/play', method: 'PUT' },
+      };
+      const ep = endpoints[command];
+      if (ep) {
+        logger.info('调用Spotify API', { url: ep.url, method: ep.method, deviceId });
+        const response = await fetch(`${ep.url}?device_id=${deviceId}`, {
+          method: ep.method,
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        logger.info('Spotify API 响应', { status: response.status, ok: response.ok });
+        if (!response.ok) {
+          speech = `操作失败 (${response.status})`;
+        }
+      }
+    }
+  } catch (e) {
+    logger.error('播放控制失败', { error: e.message, stack: e.stack });
+    speech = `操作失败: ${e.message}`;
+  }
+
+  return { command, speech, track: track ? { name: track.track_name, artist: track.artist, albumArt: track.albumArt } : null };
+}
+
+function normalizeMusicQuery(query) {
+  return String(query || '')
+    .replace(/^(一首|一曲|一个|一些|点|首)\s*/u, '')
+    .replace(/(的)?(歌|歌曲|音乐)$/u, '')
+    .trim();
 }
 
 async function handleMusic(payload) {
@@ -340,38 +373,43 @@ async function handleMusic(payload) {
 
   logger.info('handleMusic开始', { intent, match });
 
-  if (intent === 'search' || intent === 'mood' || intent === 'playSearch') {
-    tracks = await searchTracks(match);
+  if (intent === 'playlist') {
+    const playlistsData = JSON.parse(fs.readFileSync(join(__dirname, '../data/playlists.json'), 'utf-8'));
+    const playlist = playlistsData.playlists?.find(p => p.name?.includes(match));
+    if (playlist?.spotifyId) {
+      tracks = await getPlaylistTracks(playlist.spotifyId);
+      speech = `正在播放歌单：${playlist.name}`;
+    } else {
+      speech = `没有找到名为"${match}"的歌单`;
+    }
+  } else if (intent === 'search' || intent === 'mood' || intent === 'playSearch') {
+    const query = normalizeMusicQuery(match) || match;
+    tracks = await searchTracks(query);
     speech = `为你搜索到${tracks.length}首相关歌曲`;
   }
-
-  logger.info('搜索到的歌曲', { count: tracks.length, first: tracks[0]?.name });
 
   if (tracks.length > 0) {
     savePlay(tracks[0]);
     speech += `，现在播放：${tracks[0].name}，来自 ${tracks[0].artist}`;
-    logger.info('准备自动播放', { uri: tracks[0].uri, deviceId, hasToken: !!userAccessToken });
 
-    // 自动播放（使用用户token）
-    if (tracks[0].uri && deviceId && userAccessToken) {
-      logger.info('发送播放请求到Spotify', { uri: tracks[0].uri, deviceId });
-      const playResponse = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
-        method: 'PUT',
-        headers: { 'Authorization': `Bearer ${userAccessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uris: [tracks[0].uri] })
-      });
-      logger.info('Spotify播放响应', { status: playResponse.status, ok: playResponse.ok });
-      if (!playResponse.ok) {
-        const errText = await playResponse.text();
-        logger.error('播放失败', { status: playResponse.status, error: errText });
+    if (!deviceId) {
+      speech += '。但播放器设备还未就绪，请先等待 Spotify 连接完成';
+    } else if (tracks[0].uri) {
+      try {
+        const token = await getUserToken();
+        const playResponse = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+          method: 'PUT',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uris: [tracks[0].uri] })
+        });
+        logger.info('Spotify播放响应', { status: playResponse.status });
+      } catch (e) {
+        logger.error('自动播放失败', { error: e.message });
       }
-    } else {
-      logger.warn('无法自动播放', { missing: { uri: !tracks[0].uri, deviceId: !deviceId, token: !userAccessToken } });
     }
   }
 
-  await tts.speak(speech);
-  return { intent, tracks, speech };
+  return { intent, tracks, speech, track: tracks[0] ? { name: tracks[0].name, artist: tracks[0].artist, albumArt: tracks[0].albumArt } : null };
 }
 
 async function handleLLM(payload) {
@@ -383,10 +421,6 @@ async function handleLLM(payload) {
   const response = await ask(text, { systemPrompt });
 
   saveMessage('assistant', JSON.stringify(response));
-
-  if (response.should_speak !== false && response.speech) {
-    await tts.speak(response.speech);
-  }
 
   if (response.actions) {
     for (const action of response.actions) {

@@ -9,8 +9,10 @@ export const config = {
     clientId: process.env.SPOTIFY_CLIENT_ID,
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
   },
-  minimax: {
-    apiKey: process.env.MINIMAX_API_KEY,
+  mimo: {
+    apiKey: process.env.MIMO_API_KEY,
+    model: process.env.MIMO_MODEL || 'mimo-v2.5-pro',
+    baseUrl: process.env.MIMO_BASE_URL || 'https://api.xiaomimimo.com/anthropic',
   },
   db: {
     path: process.env.DB_PATH || './db/claudio.db',

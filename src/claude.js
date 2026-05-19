@@ -2,14 +2,16 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 
 export async function ask(prompt, context) {
-  const apiKey = config.minimax?.apiKey;
+  const apiKey = config.mimo?.apiKey;
+  const baseUrl = config.mimo?.baseUrl?.replace(/\/$/, '');
+  const model = config.mimo?.model;
 
   if (!apiKey) {
-    throw new Error('MINIMAX_API_KEY 未配置');
+    throw new Error('MIMO_API_KEY 未配置，请在 .env 中填写');
   }
 
   try {
-    const response = await fetch('https://api.minimaxi.com/anthropic/v1/messages', {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -18,7 +20,7 @@ export async function ask(prompt, context) {
         'anthropic-dangerous-direct-browser-access': 'true'
       },
       body: JSON.stringify({
-        model: 'MiniMax-M2.7',
+        model,
         max_tokens: 1024,
         system: context.systemPrompt,
         messages: [
@@ -29,7 +31,7 @@ export async function ask(prompt, context) {
 
     if (!response.ok) {
       const err = await response.text();
-      logger.error('MiniMax API错误', { status: response.status, error: err });
+      logger.error('MiMo API错误', { status: response.status, error: err });
       throw new Error(`API错误: ${response.status}`);
     }
 

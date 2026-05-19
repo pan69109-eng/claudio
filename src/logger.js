@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-const LOG_DIR = './logs';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const LOG_DIR = path.join(__dirname, '../logs');
 let logFile = path.join(LOG_DIR, `claudio-${new Date().toISOString().split('T')[0]}.log`);
 
 function ensureLogDir() {

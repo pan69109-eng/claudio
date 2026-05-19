@@ -1,9 +1,12 @@
 import { FishAudioClient } from 'fish-audio';
 import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
 import { config } from './config.js';
 import { logger } from './logger.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let client = null;
 
@@ -13,7 +16,7 @@ function getClient() {
   }
   return client;
 }
-const TEMP_DIR = './audio';
+const TEMP_DIR = path.join(__dirname, '../audio');
 
 function playAudio(audioPath) {
   return spawn('powershell', [

@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(yt-dlp --dump-json \"https://www.bilibili.com/video/BV1kT96BEEcD\" 2>/dev/null | head -100)",
-      "WebFetch(domain:r.jina.ai)"
-    ]
-  }
-}

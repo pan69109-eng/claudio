@@ -1,0 +1,19 @@
+{
+  "name": "claudio-radio",
+  "version": "1.0.0",
+  "description": "Claudio 个人AI电台 - MVP",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "init": "node scripts/init.js",
+    "stop": "netstat -ano | grep :3000 | awk '{print $5}' | xargs -I {} taskkill /F /PID {}"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "fish-audio": "^0.1.0",
+    "sql.js": "^1.10.2"
+  }
+}

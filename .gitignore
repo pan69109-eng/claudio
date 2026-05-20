@@ -1,3 +1,36 @@
 node_modules/
 audio/*.mp3
 *.mp3
+logs/
+新建 文本文档.txt
+.vs/
+db/
+
+# 敏感文件
+.env
+.env.local
+.env.production
+.env.development
+
+# 记述性文件
+*.txt
+*.doc
+*.docx
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.svg
+*.webp
+
+# 其他
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

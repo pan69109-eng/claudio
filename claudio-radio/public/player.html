@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claudio Radio</title>
+  <script src="https://sdk.scdn.co/spotify-player.js"></script>
+  <style>
+    :root {
+      --bg: #080a08;
+      --panel: rgba(13, 18, 14, 0.86);
+      --panel-soft: rgba(255, 255, 255, 0.07);
+      --line: rgba(255, 255, 255, 0.14);
+      --text: #f4fff7;
+      --muted: #9eb3a4;
+      --green: #1db954;
+      --green-strong: #35e06f;
+      --amber: #ffca6a;
+      --red: #ff6b6b;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(circle at 18% 10%, rgba(29, 185, 84, 0.24), transparent 30%),
+        radial-gradient(circle at 82% 18%, rgba(255, 202, 106, 0.16), transparent 26%),
+        linear-gradient(135deg, #071008 0%, #141914 48%, #050705 100%);
+    }
+
+    .shell {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 18px;
+      padding: 24px 0;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 2px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .mark {
+      width: 40px;
+      height: 40px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(53, 224, 111, 0.55);
+      background: rgba(29, 185, 84, 0.14);
+      border-radius: 8px;
+      color: var(--green-strong);
+      font-size: 22px;
+      flex: 0 0 auto;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 42px);
+      font-weight: 780;
+      letter-spacing: 0;
+      line-height: 1;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 380px minmax(0, 1fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+      backdrop-filter: blur(18px);
+    }
+
+    .player-panel {
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .album-art {
+      width: 100%;
+      aspect-ratio: 1;
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, rgba(29, 185, 84, 0.22), rgba(255, 255, 255, 0.08)),
+        repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 1px, transparent 1px 14px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      color: rgba(255,255,255,0.5);
+      font-size: 72px;
+    }
+
+    .album-art img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .track-name {
+      font-size: 24px;
+      font-weight: 750;
+      line-height: 1.18;
+      min-height: 58px;
+      overflow-wrap: anywhere;
+    }
+
+    .artist {
+      color: var(--muted);
+      min-height: 24px;
+      overflow-wrap: anywhere;
+    }
+
+    .status {
+      min-height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: var(--muted);
+      background: var(--panel-soft);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      text-align: center;
+      font-size: 14px;
+    }
+
+    .status.ready { color: var(--green-strong); border-color: rgba(53, 224, 111, 0.36); }
+    .status.error { color: var(--red); border-color: rgba(255, 107, 107, 0.42); }
+    .status.warn { color: var(--amber); border-color: rgba(255, 202, 106, 0.34); }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+
+    .queue-btn {
+      width: 100%;
+      height: 36px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .queue-panel {
+      margin-top: 12px;
+      max-height: 300px;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(0, 0, 0, 0.3);
+    }
+
+    .queue-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .queue-close {
+      height: auto;
+      border: none;
+      background: none;
+      color: var(--muted);
+      font-size: 16px;
+      padding: 0 4px;
+    }
+
+    .queue-clear {
+      height: auto;
+      border: 1px solid var(--red);
+      background: none;
+      color: var(--red);
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-right: 8px;
+    }
+
+    .queue-clear:hover {
+      background: rgba(255, 107, 107, 0.2);
+    }
+
+    .queue-list {
+      padding: 6px;
+    }
+
+    .queue-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 140ms;
+      border: none;
+      background: none;
+      width: 100%;
+      text-align: left;
+      color: var(--text);
+      font: inherit;
+    }
+
+    .queue-item:hover {
+      background: rgba(29, 185, 84, 0.15);
+    }
+
+    .queue-item-art {
+      width: 36px;
+      height: 36px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.1);
+      flex-shrink: 0;
+      overflow: hidden;
+      display: grid;
+      place-items: center;
+      font-size: 16px;
+      color: var(--muted);
+    }
+
+    .queue-item-art img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .queue-item-info {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .queue-item-name {
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .queue-item-artist {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    button, .button-link {
+      height: 42px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.1);
+      cursor: pointer;
+      font: inherit;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+
+    button:hover, .button-link:hover {
+      transform: translateY(-1px);
+      border-color: rgba(53, 224, 111, 0.5);
+      background: rgba(29, 185, 84, 0.18);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+      transform: none;
+    }
+
+    .primary {
+      background: var(--green);
+      border-color: rgba(53, 224, 111, 0.55);
+      color: #031006;
+      font-weight: 760;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-rows: 1fr auto;
+      height: 620px;
+      max-height: calc(100vh - 150px);
+      overflow: hidden;
+    }
+
+    .conversation {
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(29, 185, 84, 0.4) transparent;
+      min-height: 0;
+    }
+
+    .conversation::-webkit-scrollbar { width: 6px; }
+    .conversation::-webkit-scrollbar-track { background: transparent; }
+    .conversation::-webkit-scrollbar-thumb {
+      background: rgba(29, 185, 84, 0.4);
+      border-radius: 3px;
+    }
+    .conversation::-webkit-scrollbar-thumb:hover {
+      background: rgba(29, 185, 84, 0.6);
+    }
+
+    .message {
+      max-width: min(680px, 92%);
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      background: rgba(255, 255, 255, 0.08);
+      color: #e8f5eb;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: rgba(29, 185, 84, 0.2);
+      border-color: rgba(53, 224, 111, 0.3);
+    }
+
+    .composer {
+      padding: 16px;
+      border-top: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 112px;
+      gap: 10px;
+      background: rgba(0, 0, 0, 0.2);
+    }
+
+    input {
+      height: 46px;
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: rgba(0, 0, 0, 0.28);
+      color: var(--text);
+      padding: 0 14px;
+      font: inherit;
+      outline: none;
+    }
+
+    input:focus {
+      border-color: rgba(53, 224, 111, 0.65);
+      box-shadow: 0 0 0 3px rgba(29, 185, 84, 0.14);
+    }
+
+    .hidden { display: none !important; }
+
+    @media (max-width: 860px) {
+      .shell { width: min(100% - 20px, 620px); padding: 12px 0; }
+      header { align-items: flex-start; }
+      .layout { grid-template-columns: 1fr; }
+      .workspace { min-height: 520px; }
+      .player-panel { padding: 16px; }
+      .album-art { max-height: 320px; }
+      .composer { grid-template-columns: 1fr; }
+      .top-actions { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark">♪</div>
+        <h1>Claudio Radio</h1>
+      </div>
+      <div class="top-actions">
+        <a id="login-link" class="button-link primary hidden" href="/auth/login">登录 Spotify</a>
+        <button id="logout-btn" class="hidden" type="button" onclick="logout()">退出</button>
+      </div>
+    </header>
+
+    <section class="layout">
+      <aside class="panel player-panel">
+        <div class="album-art" id="album-art">♪</div>
+        <div>
+          <div class="track-name" id="track-name">等待播放</div>
+          <div class="artist" id="artist">输入“播放一首周杰伦的歌”开始</div>
+        </div>
+        <div id="auth-status" class="status">检查登录状态...</div>
+        <div id="device-status" class="status">播放器未连接</div>
+        <div class="controls">
+          <button type="button" onclick="skipPrevious()" title="上一首">⏮</button>
+          <button type="button" onclick="togglePlay()" title="播放或暂停">⏯</button>
+          <button type="button" onclick="skipNext()" title="下一首">⏭</button>
+        </div>
+        <button type="button" class="queue-btn" onclick="toggleQueue()" title="播放队列">📋 播放队列</button>
+        <div id="queue-panel" class="queue-panel hidden">
+          <div class="queue-header">
+            <span>播放历史</span>
+            <div>
+              <button onclick="clearQueue()" class="queue-clear" title="清空队列">清空</button>
+              <button onclick="toggleQueue()" class="queue-close">✕</button>
+            </div>
+          </div>
+          <div id="queue-list" class="queue-list"></div>
+        </div>
+      </aside>
+
+      <section class="panel workspace">
+        <div class="conversation" id="conversation">
+          <div class="message assistant">登录 Spotify 并等待设备就绪后，可以直接输入自然语言点歌或控制播放。</div>
+        </div>
+        <form class="composer" onsubmit="sendPrompt(event)">
+          <input id="prompt" type="text" placeholder="播放一首周杰伦的歌" autocomplete="off">
+          <button id="send-btn" class="primary" type="submit">发送</button>
+        </form>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    let player = null;
+    let deviceId = null;
+    let isLoggedIn = false;
+    let isPlaying = false;
+    let spotifyInitStarted = false;
+    let currentTTS = null;
+
+    const el = {
+      albumArt: document.getElementById('album-art'),
+      trackName: document.getElementById('track-name'),
+      artist: document.getElementById('artist'),
+      authStatus: document.getElementById('auth-status'),
+      deviceStatus: document.getElementById('device-status'),
+      loginLink: document.getElementById('login-link'),
+      logoutBtn: document.getElementById('logout-btn'),
+      conversation: document.getElementById('conversation'),
+      prompt: document.getElementById('prompt'),
+      sendBtn: document.getElementById('send-btn')
+    };
+
+    // 智能滚动状态
+    let isUserScrolledUp = false;
+    const SCROLL_THRESHOLD = 50;
+
+    el.conversation.addEventListener('scroll', () => {
+      const { scrollTop, scrollHeight, clientHeight } = el.conversation;
+      isUserScrolledUp = (scrollHeight - scrollTop - clientHeight) > SCROLL_THRESHOLD;
+    });
+
+    function scrollToBottomIfNeeded() {
+      if (isUserScrolledUp) return;
+      el.conversation.scrollTop = el.conversation.scrollHeight;
+    }
+
+    function addMessage(text, role = 'assistant') {
+      const item = document.createElement('div');
+      item.className = `message ${role}`;
+      item.textContent = text;
+      el.conversation.appendChild(item);
+      scrollToBottomIfNeeded();
+      trimOldMessages();
+    }
+
+    const MAX_MESSAGES = 100;
+    function trimOldMessages() {
+      const msgs = el.conversation.querySelectorAll('.message');
+      if (msgs.length > MAX_MESSAGES) {
+        for (let i = 0; i < msgs.length - MAX_MESSAGES; i++) msgs[i].remove();
+      }
+    }
+
+    function setStatus(node, text, type = '') {
+      node.className = `status ${type}`.trim();
+      node.textContent = text;
+    }
+
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/auth-status');
+        const data = await res.json();
+        isLoggedIn = Boolean(data.loggedIn && data.tokenValid);
+        el.loginLink.classList.toggle('hidden', isLoggedIn);
+        el.logoutBtn.classList.toggle('hidden', !isLoggedIn);
+
+        if (!isLoggedIn) {
+          setStatus(el.authStatus, '需要登录 Spotify', 'warn');
+          setStatus(el.deviceStatus, '登录后会连接播放器', '');
+          el.prompt.disabled = true;
+          el.sendBtn.disabled = true;
+          return;
+        }
+
+        setStatus(el.authStatus, 'Spotify 已登录', 'ready');
+        el.prompt.disabled = false;
+        el.sendBtn.disabled = false;
+        initSpotifyPlayer();
+      } catch (err) {
+        setStatus(el.authStatus, '登录状态检查失败', 'error');
+      }
+    }
+
+    function initSpotifyPlayer() {
+      if (spotifyInitStarted) return;
+      spotifyInitStarted = true;
+      setStatus(el.deviceStatus, '正在初始化播放器...');
+
+      const createPlayer = () => {
+        if (!window.Spotify) {
+          setStatus(el.deviceStatus, 'Spotify SDK 未加载', 'error');
+          return;
+        }
+
+        player = new Spotify.Player({
+          name: 'Claudio Radio',
+          getOAuthToken: (callback) => {
+            fetch('/api/token')
+              .then(res => res.json())
+              .then(data => callback(data.token))
+              .catch(() => callback(null));
+          },
+          volume: 0.5
+        });
+
+        player.addListener('initialization_error', ({ message }) => showError('初始化错误: ' + message));
+        player.addListener('authentication_error', ({ message }) => showError('认证错误: ' + message));
+        player.addListener('account_error', ({ message }) => showError('账户错误: ' + message + '，需要 Spotify Premium'));
+        player.addListener('playback_error', ({ message }) => showError('播放错误: ' + message));
+
+        player.addListener('ready', ({ device_id }) => {
+          deviceId = device_id;
+          setStatus(el.deviceStatus, '设备已就绪', 'ready');
+          fetch('/api/device-ready', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceId })
+          });
+        });
+
+        player.addListener('not_ready', ({ device_id }) => {
+          if (deviceId === device_id) deviceId = null;
+          setStatus(el.deviceStatus, '设备离线', 'warn');
+        });
+
+        player.addListener('player_state_changed', (state) => {
+          if (!state) return;
+          const track = state.track_window.current_track;
+          isPlaying = !state.paused;
+          el.trackName.textContent = track.name;
+          el.artist.textContent = track.artists.map(a => a.name).join(', ');
+          const cover = track.album.images && track.album.images[0]?.url;
+          el.albumArt.innerHTML = cover ? `<img src="${cover}" alt="">` : '♪';
+        });
+
+        player.connect();
+      };
+
+      if (window.Spotify) {
+        createPlayer();
+      } else {
+        window.onSpotifyWebPlaybackSDKReady = createPlayer;
+      }
+    }
+
+    function showError(message) {
+      setStatus(el.deviceStatus, message, 'error');
+      addMessage(message);
+    }
+
+    async function sendPrompt(event) {
+      event.preventDefault();
+      const text = el.prompt.value.trim();
+      if (!text) return;
+
+      addMessage(text, 'user');
+      el.prompt.value = '';
+      el.sendBtn.disabled = true;
+
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text })
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          addMessage(data.message || data.error || '请求失败');
+          return;
+        }
+
+        if (data.speech) addMessage(data.speech);
+        const track = data.track || data.tracks?.[0];
+        if (track) {
+          el.trackName.textContent = track.name;
+          el.artist.textContent = track.artist || '';
+          if (track.albumArt) el.albumArt.innerHTML = `<img src="${track.albumArt}" alt="">`;
+        }
+
+        // TTS 播放 + 音乐编排
+        if (data.ttsAudioUrl) {
+          playTTSWithMusic(data.ttsAudioUrl, data.track);
+        } else if (data.track?.uri) {
+          playMusic(data.track.uri);
+        }
+      } catch (err) {
+        addMessage('发送失败: ' + err.message);
+      } finally {
+        el.sendBtn.disabled = !isLoggedIn;
+        el.prompt.focus();
+      }
+    }
+
+    function playTTSWithMusic(ttsUrl, track) {
+      if (currentTTS) { currentTTS.pause(); currentTTS = null; }
+
+      const audio = new Audio(ttsUrl);
+      currentTTS = audio;
+
+      audio.play().catch(() => {
+        currentTTS = null;
+        if (track?.uri) playMusic(track.uri);
+      });
+
+      audio.onended = () => {
+        currentTTS = null;
+        if (track?.uri) playMusic(track.uri);
+      };
+
+      audio.onerror = () => {
+        currentTTS = null;
+        if (track?.uri) playMusic(track.uri);
+      };
+    }
+
+    async function playMusic(uri) {
+      if (!uri) return;
+      try {
+        await fetch('/api/play', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uri })
+        });
+      } catch (err) {
+        console.error('播放音乐失败:', err);
+      }
+    }
+
+    function togglePlay() {
+      if (player) player.togglePlay();
+    }
+
+    async function skipNext() {
+      try {
+        const res = await fetch('/api/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'next' })
+        });
+        const data = await res.json();
+        if (data.speech) addMessage(data.speech);
+      } catch (err) {
+        addMessage('切歌失败: ' + err.message);
+      }
+    }
+
+    async function skipPrevious() {
+      try {
+        const res = await fetch('/api/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'previous' })
+        });
+        const data = await res.json();
+        if (data.speech) addMessage(data.speech);
+      } catch (err) {
+        addMessage('切歌失败: ' + err.message);
+      }
+    }
+
+    async function toggleQueue() {
+      const panel = document.getElementById('queue-panel');
+      if (panel.classList.contains('hidden')) {
+        await loadQueue();
+        panel.classList.remove('hidden');
+      } else {
+        panel.classList.add('hidden');
+      }
+    }
+
+    async function loadQueue() {
+      try {
+        const res = await fetch('/api/history?limit=20');
+        const data = await res.json();
+        const list = document.getElementById('queue-list');
+        if (!data.history || data.history.length === 0) {
+          list.innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-size:13px">暂无播放记录</div>';
+          return;
+        }
+        list.innerHTML = data.history.reverse().map(item => `
+          <button class="queue-item" onclick="playFromQueue('${item.uri}', '${escapeHtml(item.track_name)}', '${escapeHtml(item.artist)}', '${item.albumArt || ''}')">
+            <div class="queue-item-art">${item.albumArt ? `<img src="${item.albumArt}" alt="">` : '♪'}</div>
+            <div class="queue-item-info">
+              <div class="queue-item-name">${escapeHtml(item.track_name)}</div>
+              <div class="queue-item-artist">${escapeHtml(item.artist)}</div>
+            </div>
+          </button>
+        `).join('');
+      } catch (err) {
+        console.error('加载队列失败', err);
+      }
+    }
+
+    async function playFromQueue(uri, name, artist, albumArt) {
+      if (!uri) {
+        addMessage('该歌曲缺少播放链接');
+        return;
+      }
+      try {
+        const res = await fetch('/api/play', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uri })
+        });
+        if (res.ok) {
+          el.trackName.textContent = name;
+          el.artist.textContent = artist;
+          if (albumArt) el.albumArt.innerHTML = `<img src="${albumArt}" alt="">`;
+          addMessage(`正在播放：${name} - ${artist}`);
+        } else {
+          addMessage('播放失败');
+        }
+      } catch (err) {
+        addMessage('播放失败: ' + err.message);
+      }
+    }
+
+    function escapeHtml(str) {
+      return String(str || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    async function clearQueue() {
+      if (!confirm('确定要清空播放队列吗？')) return;
+      try {
+        const res = await fetch('/api/history', { method: 'DELETE' });
+        if (res.ok) {
+          addMessage('播放队列已清空');
+          loadQueue(); // 刷新队列显示
+        } else {
+          addMessage('清空失败');
+        }
+      } catch (err) {
+        addMessage('清空失败: ' + err.message);
+      }
+    }
+
+    function logout() {
+      fetch('/auth/logout', { method: 'POST' }).then(() => window.location.reload());
+    }
+
+    checkAuth();
+  </script>
+</body>
+</html>

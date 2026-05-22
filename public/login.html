@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Claudio Radio - Login</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1DB954 0%, #191414 100%);
+      color: white;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .login-box {
+      text-align: center;
+      padding: 40px;
+      background: rgba(0,0,0,0.5);
+      border-radius: 20px;
+      backdrop-filter: blur(10px);
+    }
+    h1 { color: #1DB954; }
+    .btn {
+      display: inline-block;
+      padding: 15px 30px;
+      background: #1DB954;
+      color: white;
+      text-decoration: none;
+      border-radius: 30px;
+      font-size: 18px;
+      margin-top: 20px;
+      transition: background 0.3s;
+    }
+    .btn:hover { background: #1ed760; }
+    .info { color: #ccc; margin-top: 20px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="login-box">
+    <h1>Claudio Radio</h1>
+    <p>连接您的 Spotify 账号</p>
+    <a href="/auth/login" class="btn">使用 Spotify 登录</a>
+    <p class="info">需要 Spotify Premium 账号</p>
+  </div>
+</body>
+</html>

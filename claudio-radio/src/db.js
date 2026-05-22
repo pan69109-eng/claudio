@@ -8,6 +8,7 @@ const DB_FILE = path.join(__dirname, '../db/data.json');
 
 const messages = [];
 const playHistory = [];
+const prefs = {}; // 用户偏好（跨会话保留）
 let currentIndex = -1; // 当前播放的索引
 
 function loadFromDisk() {
@@ -16,6 +17,8 @@ function loadFromDisk() {
       const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
       if (data.messages) messages.push(...data.messages);
       if (data.playHistory) playHistory.push(...data.playHistory);
+      if (playHistory.length > 0) currentIndex = playHistory.length - 1;
+      if (data.prefs) Object.assign(prefs, data.prefs);
       logger.info('从磁盘加载数据', { messages: messages.length, plays: playHistory.length });
     }
   } catch (e) {
@@ -27,7 +30,7 @@ function saveToDisk() {
   try {
     const dir = path.dirname(DB_FILE);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(DB_FILE, JSON.stringify({ messages, playHistory }, null, 2));
+    fs.writeFileSync(DB_FILE, JSON.stringify({ messages, playHistory, prefs }, null, 2));
   } catch (e) {
     logger.warn('保存数据库文件失败', { error: e.message });
   }
@@ -71,8 +74,13 @@ export function savePlay(track) {
 
 export function getNextTrack() {
   if (playHistory.length === 0) return null;
-  // 返回最后一首歌（最新播放的）
-  return playHistory[playHistory.length - 1];
+
+  const nextIndex = currentIndex + 1;
+  if (nextIndex >= playHistory.length) return null;
+
+  currentIndex = nextIndex;
+  saveToDisk();
+  return playHistory[currentIndex];
 }
 
 export function getPreviousTrack() {
@@ -94,6 +102,29 @@ export function getCurrentTrack() {
   return playHistory.length > 0 ? playHistory[playHistory.length - 1] : null;
 }
 
+export function setCurrentTrackByUri(uri) {
+  if (!uri) return null;
+
+  const index = playHistory.findLastIndex(track => track.uri === uri);
+  if (index === -1) return null;
+
+  currentIndex = index;
+  saveToDisk();
+  return playHistory[currentIndex];
+}
+
+export function setCurrentTrackById(id) {
+  const numericId = Number(id);
+  if (!Number.isFinite(numericId)) return null;
+
+  const index = playHistory.findIndex(track => track.id === numericId);
+  if (index === -1) return null;
+
+  currentIndex = index;
+  saveToDisk();
+  return playHistory[currentIndex];
+}
+
 export function getRecentPlays(limit = 20) {
   return playHistory.slice(-limit);
 }
@@ -107,4 +138,20 @@ export function clearPlayHistory() {
   currentIndex = -1;
   saveToDisk();
   logger.info('播放历史已清空');
+}
+
+export function clearMessages() {
+  messages.length = 0;
+  saveToDisk();
+  logger.info('对话消息已清空');
+}
+
+export function savePlaylistPreference(playlistId) {
+  prefs.playlistId = playlistId;
+  saveToDisk();
+  logger.info('歌单偏好已保存', { playlistId });
+}
+
+export function getPlaylistPreference() {
+  return prefs.playlistId || null;
 }

@@ -9,10 +9,10 @@ export const config = {
     clientId: process.env.SPOTIFY_CLIENT_ID,
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
   },
-  mimo: {
-    apiKey: process.env.MIMO_API_KEY,
-    model: process.env.MIMO_MODEL || 'mimo-v2.5',
-    baseUrl: process.env.MIMO_BASE_URL || 'https://api.xiaomimimo.com/anthropic',
+  llm: {
+    apiKey: process.env.LLM_API_KEY,
+    model: process.env.LLM_MODEL || 'deepseek-v4-flash',
+    baseUrl: process.env.LLM_BASE_URL || 'https://api.deepseek.com/v1',
   },
   db: {
     path: process.env.DB_PATH || './db/claudio.db',

@@ -2,28 +2,27 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 
 export async function ask(prompt, context) {
-  const apiKey = config.mimo?.apiKey;
-  const baseUrl = config.mimo?.baseUrl?.replace(/\/$/, '');
-  const model = config.mimo?.model;
+  const apiKey = config.llm?.apiKey;
+  const baseUrl = config.llm?.baseUrl?.replace(/\/$/, '');
+  const model = config.llm?.model;
 
   if (!apiKey) {
-    throw new Error('MIMO_API_KEY 未配置，请在 .env 中填写');
+    throw new Error('LLM_API_KEY 未配置，请在 .env 中填写');
   }
 
   try {
-    const response = await fetch(`${baseUrl}/v1/messages`, {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
+        'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model,
         max_tokens: 1024,
-        system: context.systemPrompt,
+        thinking: { type: 'disabled' },
         messages: [
+          { role: 'system', content: context.systemPrompt },
           { role: 'user', content: prompt }
         ]
       })
@@ -31,14 +30,12 @@ export async function ask(prompt, context) {
 
     if (!response.ok) {
       const err = await response.text();
-      logger.error('MiMo API错误', { status: response.status, error: err });
+      logger.error('LLM API错误', { status: response.status, error: err });
       throw new Error(`API错误: ${response.status}`);
     }
 
     const data = await response.json();
-
-    // 解析响应
-    const content = data.content?.[0]?.text || '';
+    const content = data.choices?.[0]?.message?.content || '';
 
     // 尝试解析JSON响应
     try {

@@ -1,5 +1,4 @@
 import { FishAudioClient } from 'fish-audio';
-import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
@@ -18,11 +17,19 @@ function getClient() {
 }
 const TEMP_DIR = path.join(__dirname, '../audio');
 
-function playAudio(audioPath) {
-  return spawn('powershell', [
-    '-c',
-    `Start-Process -FilePath wmplayer -ArgumentList '${audioPath.replace(/'/g, "''")}','/Play','/Close' -WindowStyle Hidden`
-  ]);
+// 清理文本，避免 TTS 读出特殊字符
+function cleanText(text) {
+  return String(text || '')
+    .replace(/\\n/gi, ' ')    // \n 字面量
+    .replace(/\\r/gi, ' ')
+    .replace(/\\t/gi, ' ')
+    .replace(/\n/g, ' ')      // 真实换行
+    .replace(/\r/g, ' ')
+    .replace(/\t/g, ' ')
+    .replace(/~/g, '，')      // 波浪号替换为逗号（自然停顿）
+    .replace(/[_]{2,}/g, ' ') // 多个下划线
+    .replace(/\s{2,}/g, ' ')  // 多个空格合并
+    .trim();
 }
 
 export class TTSPipeline {
@@ -32,53 +39,11 @@ export class TTSPipeline {
     }
   }
 
-  async speak(text, options = {}) {
-    try {
-      const referenceId = options.referenceId || config.fishAudio.referenceId;
-      const requestOptions = {
-        text,
-        format: 'mp3',
-        prosody: { speed: options.speed || 1.0 },
-      };
-
-      if (referenceId) {
-        requestOptions.reference_id = referenceId;
-      }
-
-      const audioData = await getClient().textToSpeech.convert(requestOptions, 's2-pro');
-
-      const staticFile = path.join(TEMP_DIR, `tts_${Date.now()}.mp3`);
-      const chunks = [];
-      for await (const chunk of audioData) {
-        chunks.push(chunk);
-      }
-      fs.writeFileSync(staticFile, Buffer.concat(chunks));
-
-      logger.info('TTS生成完成', { file: staticFile, text: text.substring(0, 30) });
-
-      playAudio(staticFile);
-      logger.info('TTS播放中', { text: text.substring(0, 30) });
-
-      setTimeout(() => {
-        try {
-          if (fs.existsSync(staticFile)) {
-            fs.unlinkSync(staticFile);
-          }
-        } catch (e) { }
-      }, 5 * 60 * 1000);
-
-      return staticFile;
-    } catch (error) {
-      logger.error('TTS失败', { error: error.message });
-      throw error;
-    }
-  }
-
   async generate(text, options = {}) {
     try {
       const referenceId = options.referenceId || config.fishAudio.referenceId;
       const requestOptions = {
-        text,
+        text: cleanText(text),
         format: 'mp3',
         prosody: { speed: options.speed || 1.0 },
       };

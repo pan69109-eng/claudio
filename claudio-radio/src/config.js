@@ -12,7 +12,7 @@ export const config = {
   llm: {
     apiKey: process.env.LLM_API_KEY,
     model: process.env.LLM_MODEL || 'deepseek-v4-flash',
-    baseUrl: process.env.LLM_BASE_URL || 'https://api.deepseek.com/v1',
+    baseUrl: process.env.LLM_BASE_URL || 'https://api.deepseek.com',
   },
   db: {
     path: process.env.DB_PATH || './db/claudio.db',

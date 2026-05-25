@@ -733,7 +733,7 @@
             if (playlist.isLikedSongs) option.textContent += ' \u2665';
             select.appendChild(option);
           });
-          console.log('歌单加载成功', data.playlists.length, '个');
+
 
           // 恢复上次选择的歌单
           if (data.playlistPreference) {
@@ -760,7 +760,7 @@
       const selected = select.options[select.selectedIndex];
       selectedPlaylistId = select.value || null;
       selectedPlaylistTracksHref = selected?.dataset.tracksHref || '';
-      console.log('已选择连播歌单', { playlistId: selectedPlaylistId, tracksHref: selectedPlaylistTracksHref });
+
       fetch('/api/playlist-preference', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -772,7 +772,7 @@
     function handlePlayerStateChange(state) {
       if (!state) {
         if (lastTrackId && !trackEndedHandled) {
-          console.log('播放状态为空，可能歌曲已结束');
+
           trackEndedHandled = true;
           const lastTrack = lastKnownTrack;
           if (lastTrack) {
@@ -808,7 +808,7 @@
 
       // 检测歌曲切换：重置所有预生成状态
       if (lastTrackId && lastTrackId !== currentTrackId) {
-        console.log('检测到歌曲切换', { from: lastTrackId, to: currentTrackId });
+
         trackEndedHandled = false;
         preGeneratedTransition = null;
         pendingTransition = null;
@@ -848,7 +848,7 @@
           const remaining = track.duration_ms - state.position;
           // 歌曲已结束（剩余时间 <= 1秒）
           if (remaining <= 1000 && !trackEndedHandled) {
-            console.log('轮播检测到歌曲结束');
+
             trackEndedHandled = true;
             stopProgressPoll();
             handleTrackEnded(track);
@@ -895,7 +895,7 @@
       prepCancelled = false;
       enterPreparationMode();
       updatePrepStatus('red', '^_^');
-      console.log('预生成阶段1：开始选歌', { track: currentTrack.name });
+
 
       try {
         const res = await fetch('/api/select-next', {
@@ -914,7 +914,7 @@
 
         // 竞态检测：用户已切歌或取消
         if (prepCancelled || currentTrack.id !== prepSongId) {
-          console.log('预生成阶段1：结果被丢弃（竞态/取消）');
+
           return;
         }
 
@@ -924,10 +924,10 @@
             selectedNextTrack = data.nextTrack;
             prepPhase = 'speech-pending';
             updatePrepStatus('yellow', data.nextTrack.name);
-            console.log('预生成阶段1完成，进入阶段2', { nextTrack: data.nextTrack.name });
+
             generateSpeechAndTTS(currentTrack, data.nextTrack);
           } else {
-            console.log('预生成阶段1：无下一首可选');
+
             exitPreparationMode();
             prepPhase = 'idle';
           }
@@ -945,7 +945,7 @@
 
     // 阶段2：生成过渡词 + TTS
     async function generateSpeechAndTTS(currentTrack, nextTrack) {
-      console.log('预生成阶段2：开始生成过渡词+TTS', { nextTrack: nextTrack.name });
+
 
       try {
         const res = await fetch('/api/generate-speech-tts', {
@@ -967,7 +967,7 @@
 
         // 竞态检测 + 取消检测
         if (prepCancelled || currentTrack.id !== prepSongId) {
-          console.log('预生成阶段2：结果被丢弃（竞态/取消）');
+
           return;
         }
 
@@ -980,7 +980,7 @@
           };
           prepPhase = 'ready';
           updatePrepStatus('green', selectedNextTrack.name);
-          console.log('预生成阶段2完成，进入就绪状态');
+
         } else {
           console.error('generate-speech-tts 响应错误', res.status);
           prepPhase = 'idle';
@@ -995,9 +995,9 @@
 
     // 处理歌曲结束（三路径：绿灯/黄灯/红灯）
     async function handleTrackEnded(currentTrack) {
-      console.log('歌曲结束', { track: currentTrack.name, prepPhase, isPaused });
+
       if (isPaused) {
-        console.log('已暂停，跳过自动连播');
+
         return;
       }
 
@@ -1091,7 +1091,7 @@
         }
 
         const data = await res.json();
-        console.log('auto-next 结果', data);
+
 
         if (!data.nextTrack) {
           addMessage(data.speech || '没有找到下一首歌曲');
@@ -1256,14 +1256,14 @@
     }
 
     function playTTSWithMusic(ttsUrl, track) {
-      console.log('playTTSWithMusic', { ttsUrl, trackName: track?.name });
+
       if (currentTTS) { currentTTS.pause(); currentTTS = null; }
 
       const audio = new Audio(ttsUrl);
       currentTTS = audio;
 
       audio.play().then(() => {
-        console.log('TTS 开始播放');
+
       }).catch((err) => {
         console.error('TTS 播放失败:', err);
         currentTTS = null;
@@ -1271,7 +1271,7 @@
       });
 
       audio.onended = () => {
-        console.log('TTS 播放完毕，开始播放音乐');
+
         currentTTS = null;
         if (track?.uri) playMusic(track.uri);
       };
@@ -1309,21 +1309,6 @@
       }
 
       if (player) {
-        if (isPaused && pendingTransition) {
-          const transitionData = pendingTransition;
-          pendingTransition = null;
-          isPaused = false;
-
-          if (transitionData.speech) {
-            addMessage(transitionData.speech);
-          }
-          if (transitionData.ttsAudioUrl && transitionData.nextTrack) {
-            playTTSWithMusic(transitionData.ttsAudioUrl, transitionData.nextTrack);
-          } else if (transitionData.nextTrack?.uri) {
-            playMusic(transitionData.nextTrack.uri);
-          }
-          return;
-        }
         player.togglePlay();
       }
     }

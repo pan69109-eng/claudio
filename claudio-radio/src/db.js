@@ -129,10 +129,6 @@ export function getRecentPlays(limit = 20) {
   return playHistory.slice(-limit);
 }
 
-export function getDb() {
-  return { messages, playHistory };
-}
-
 export function clearPlayHistory() {
   playHistory.length = 0;
   currentIndex = -1;

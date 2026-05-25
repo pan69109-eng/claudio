@@ -58,6 +58,3 @@ export async function ask(prompt, context) {
   }
 }
 
-export async function askStream(prompt, context, onChunk) {
-  throw new Error('流式输出暂不支持');
-}

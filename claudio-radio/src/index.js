@@ -1,16 +1,15 @@
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { createServer } from 'http';
 import { exec } from 'child_process';
 import fs from 'fs';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { errorHandler } from './errorHandler.js';
-import { initDb, saveMessage, getMessages, savePlay, getRecentPlays, getNextTrack, getPreviousTrack, clearPlayHistory, clearMessages, savePlaylistPreference, getPlaylistPreference, setCurrentTrackByUri, setCurrentTrackById } from './db.js';
+import { initDb, saveMessage, savePlay, getRecentPlays, getNextTrack, getPreviousTrack, clearPlayHistory, clearMessages, savePlaylistPreference, getPlaylistPreference, setCurrentTrackByUri, setCurrentTrackById } from './db.js';
 import { route } from './router.js';
 import { buildContext } from './context.js';
-import { ask } from './claude.js';
+import { ask } from './llm.js';
 import { searchTracks, getPlaylistTracks, getUserPlaylists, getUserPlaylistTracks } from './spotify.js';
 import { TTSPipeline } from './tts.js';
 
@@ -18,7 +17,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
-const server = createServer(app);
 const tts = new TTSPipeline();
 tts.clearCache();
 
@@ -311,39 +309,7 @@ app.post('/api/select-next', async (req, res) => {
 app.post('/api/generate-speech-tts', async (req, res) => {
   try {
     const { currentTrack, nextTrack } = req.body;
-
-    const recentHistory = getRecentPlays(5);
-    const envContext = { time: new Date().toLocaleTimeString('zh-CN') };
-    const { systemPrompt } = buildContext('', envContext, recentHistory);
-
-    const llmPrompt = `当前歌曲刚播放完毕：${currentTrack?.name || '未知'} - ${currentTrack?.artist || '未知'}
-下一首歌曲：${nextTrack?.name || '未知'} - ${nextTrack?.artist || '未知'}
-
-请作为电台DJ，用温暖自然的语气：
-1. 简短总结上一首歌（1-2句话）
-2. 生成过渡词，自然地引出下一首歌
-3. 介绍下一首歌的特点或亮点
-
-回复要简洁，控制在3-4句话，有陪伴感。`;
-
-    let speech = '';
-    try {
-      const response = await ask(llmPrompt, { systemPrompt });
-      speech = response.speech || response.response_type === 'speak' ? (response.speech || '') : JSON.stringify(response);
-    } catch (e) {
-      logger.error('generate-speech-tts LLM生成失败', { error: e.message });
-      speech = `接下来为你播放：${nextTrack?.name || '未知'} - ${nextTrack?.artist || '未知'}`;
-    }
-
-    let ttsAudioUrl = null;
-    if (speech) {
-      try {
-        ttsAudioUrl = await tts.generate(speech);
-      } catch (e) {
-        logger.error('generate-speech-tts TTS生成失败', { error: e.message });
-      }
-    }
-
+    const { speech, ttsAudioUrl } = await generateTransitionSpeech(currentTrack, nextTrack);
     res.json({ speech, ttsAudioUrl });
   } catch (err) {
     logger.error('generate-speech-tts失败', { error: err.message });
@@ -469,41 +435,10 @@ app.post('/api/auto-next', async (req, res) => {
       return res.json({ nextTrack: null, speech: '没有找到下一首歌曲', ttsAudioUrl: null, ready: false });
     }
 
-    // 2. 生成过渡词
-    const recentHistory = getRecentPlays(5);
-    const envContext = { time: new Date().toLocaleTimeString('zh-CN') };
-    const { systemPrompt } = buildContext('', envContext, recentHistory);
+    // 2. 生成过渡词 + TTS
+    const { speech, ttsAudioUrl } = await generateTransitionSpeech(currentTrack, nextTrack);
 
-    const llmPrompt = `当前歌曲刚播放完毕：${currentTrack?.name || '未知'} - ${currentTrack?.artist || '未知'}
-下一首歌曲：${nextTrack.name} - ${nextTrack.artist}
-
-请作为电台DJ，用温暖自然的语气：
-1. 简短总结上一首歌（1-2句话）
-2. 生成过渡词，自然地引出下一首歌
-3. 介绍下一首歌的特点或亮点
-
-回复要简洁，控制在3-4句话，有陪伴感。`;
-
-    let speech = '';
-    try {
-      const response = await ask(llmPrompt, { systemPrompt });
-      speech = response.speech || response.response_type === 'speak' ? (response.speech || '') : JSON.stringify(response);
-    } catch (e) {
-      logger.error('auto-next LLM生成失败', { error: e.message });
-      speech = `接下来为你播放：${nextTrack.name} - ${nextTrack.artist}`;
-    }
-
-    // 3. 生成 TTS
-    let ttsAudioUrl = null;
-    if (speech) {
-      try {
-        ttsAudioUrl = await tts.generate(speech);
-      } catch (e) {
-        logger.error('auto-next TTS生成失败', { error: e.message });
-      }
-    }
-
-    // 4. 保存播放记录
+    // 3. 保存播放记录
     savePlay(nextTrack);
 
     res.json({
@@ -517,6 +452,49 @@ app.post('/api/auto-next', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// 生成过渡词 + TTS（共享函数）
+async function generateTransitionSpeech(currentTrack, nextTrack) {
+  const recentHistory = getRecentPlays(5);
+  const envContext = { time: new Date().toLocaleTimeString('zh-CN') };
+  const { systemPrompt } = buildContext('', envContext, recentHistory);
+
+  const llmPrompt = `当前歌曲刚播放完毕：${currentTrack?.name || '未知'} - ${currentTrack?.artist || '未知'}
+下一首歌曲：${nextTrack?.name || '未知'} - ${nextTrack?.artist || '未知'}
+
+请作为电台DJ，用温暖自然的语气：
+1. 简短总结上一首歌（1-2句话）
+2. 生成过渡词，自然地引出下一首歌
+3. 介绍下一首歌的特点或亮点
+
+回复要简洁，控制在3-4句话，有陪伴感。`;
+
+  let speech = '';
+  try {
+    const response = await ask(llmPrompt, { systemPrompt });
+    if (response.speech) {
+      speech = response.speech;
+    } else if (response.response_type === 'speak') {
+      speech = response.speech || '';
+    } else {
+      speech = JSON.stringify(response);
+    }
+  } catch (e) {
+    logger.error('LLM生成过渡词失败', { error: e.message });
+    speech = `接下来为你播放：${nextTrack?.name || '未知'} - ${nextTrack?.artist || '未知'}`;
+  }
+
+  let ttsAudioUrl = null;
+  if (speech) {
+    try {
+      ttsAudioUrl = await tts.generate(speech);
+    } catch (e) {
+      logger.error('TTS生成失败', { error: e.message });
+    }
+  }
+
+  return { speech, ttsAudioUrl };
+}
 
 async function selectNextTrackForTransition(currentTrack, playlistId, tracksHref = '') {
   if (!playlistId) return null;
@@ -607,6 +585,20 @@ function findTrackByKeywords(tracks, keywords) {
   return bestTrack;
 }
 
+// Spotify 播放控制（next/previous 共享逻辑）
+async function spotifyPlaybackControl(token, action) {
+  const endpoint = action === 'next' ? getNextTrack() : getPreviousTrack();
+  if (!endpoint?.uri) return { track: null, success: false };
+
+  const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uris: [endpoint.uri] })
+  });
+
+  return { track: endpoint, success: response.ok };
+}
+
 // 解析 JWT 获取 scopes
 function getTokenScopes(token) {
   try {
@@ -637,6 +629,14 @@ async function getUserToken() {
       })
     });
     const data = await response.json();
+
+    if (!response.ok || data.error) {
+      userAccessToken = null;
+      userRefreshToken = null;
+      userTokenExpiry = 0;
+      throw new Error(data.error_description || 'Token 刷新失败');
+    }
+
     userAccessToken = data.access_token;
     userTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
     if (data.refresh_token) {
@@ -691,39 +691,14 @@ async function handleCommand(payload) {
     const token = await getUserToken();
 
     // 对于 next/previous，使用本地播放历史
-    if (command === 'next') {
-      track = getNextTrack();
-      if (track && track.uri) {
-        logger.info('播放下一首', { track: track.track_name, uri: track.uri });
-        const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
-          method: 'PUT',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uris: [track.uri] })
-        });
-        if (response.ok) {
-          speech = `正在播放：${track.track_name} - ${track.artist}`;
-        } else {
-          speech = '切歌失败';
-        }
+    if (command === 'next' || command === 'previous') {
+      const result = await spotifyPlaybackControl(token, command);
+      track = result.track;
+      if (track) {
+        logger.info(`播放${command === 'next' ? '下一首' : '上一首'}`, { track: track.track_name, uri: track.uri });
+        speech = result.success ? `正在播放：${track.track_name} - ${track.artist}` : '切歌失败';
       } else {
-        speech = '没有可播放的歌曲';
-      }
-    } else if (command === 'previous') {
-      track = getPreviousTrack();
-      if (track && track.uri) {
-        logger.info('播放上一首', { track: track.track_name, uri: track.uri });
-        const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
-          method: 'PUT',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uris: [track.uri] })
-        });
-        if (response.ok) {
-          speech = `正在播放：${track.track_name} - ${track.artist}`;
-        } else {
-          speech = '切歌失败';
-        }
-      } else {
-        speech = '没有上一首歌曲';
+        speech = command === 'next' ? '没有可播放的歌曲' : '没有上一首歌曲';
       }
     } else {
       // pause/play 继续使用 Spotify API
@@ -798,7 +773,13 @@ async function handleMusic(payload) {
   let speech = '';
   try {
     const response = await ask(llmPrompt, { systemPrompt });
-    speech = response.speech || response.response_type === 'speak' ? (response.speech || '') : JSON.stringify(response);
+    if (response.speech) {
+      speech = response.speech;
+    } else if (response.response_type === 'speak') {
+      speech = response.speech || '';
+    } else {
+      speech = JSON.stringify(response);
+    }
   } catch (e) {
     logger.error('handleMusic LLM生成失败', { error: e.message });
     // 降级到简单回复
@@ -870,7 +851,7 @@ async function main() {
   clearMessages();
   clearPlayHistory();
 
-  server.listen(config.app.port, () => {
+  app.listen(config.app.port, () => {
     const url = `http://localhost:${config.app.port}`;
     logger.info('Claudio电台启动', { port: config.app.port });
     exec(`start ${url}`);

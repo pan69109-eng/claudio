@@ -3,7 +3,6 @@ node_modules/
 
 # Environment
 .env
-.env.example
 
 # Audio files
 audio/*.mp3
@@ -24,3 +23,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Claude Code local
+.claude/

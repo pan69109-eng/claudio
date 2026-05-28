@@ -36,11 +36,12 @@
     .shell {
       width: min(1120px, calc(100% - 32px));
       margin: 0 auto;
-      min-height: 100vh;
+      height: 100vh;
       display: grid;
       grid-template-rows: auto 1fr;
       gap: 18px;
       padding: 24px 0;
+      box-sizing: border-box;
     }
 
     header {
@@ -657,6 +658,7 @@
     let currentTTS = null;
     let lastTrackId = null;
     let trackEndedHandled = false;
+    let trackEndingInProgress = false; // 防止 handleTrackEnded 重入
     let preGeneratedTransition = null;
     let isPaused = false;
     let pendingTransition = null;
@@ -809,26 +811,26 @@
       // 检测歌曲切换：重置所有预生成状态
       if (lastTrackId && lastTrackId !== currentTrackId) {
 
-        trackEndedHandled = false;
         preGeneratedTransition = null;
         pendingTransition = null;
         prepPhase = 'idle';
         selectedNextTrack = null;
         prepSongId = null;
-        prepCancelled = false;
+        prepCancelled = true;  // 先取消当前预生成
         exitPreparationMode();
+        // 重置取消标志和 trackEndedHandled，允许新歌的预生成
+        setTimeout(() => {
+          prepCancelled = false;
+          trackEndedHandled = false;
+        }, 100);
       }
 
-      // 新歌开始播放时立即启动预生成
-      if (!state.paused && prepPhase === 'idle') {
+      // 新歌开始播放时立即启动预生成（只有在 trackEndedHandled 为 false 时）
+      if (!state.paused && prepPhase === 'idle' && !trackEndedHandled) {
         startNextSongPreparation(track);
       }
 
-      // 检测歌曲是否结束（播放位置接近结束且暂停）
-      if (state.paused && currentPosition > (trackDuration - 1000) && !trackEndedHandled) {
-        trackEndedHandled = true;
-        handleTrackEnded(track);
-      }
+      // 歌曲结束检测统一由进度轮询处理，避免竞态条件
 
       lastTrackId = currentTrackId;
     }
@@ -887,6 +889,9 @@
       }
     }
 
+    // Taste 分析状态缓存
+    let tasteAnalysisCache = {};  // { [playlistId]: { status: 'done'|'failed', time: number } }
+
     // 阶段1：选歌
     async function startNextSongPreparation(currentTrack) {
       if (prepPhase !== 'idle') return;
@@ -898,6 +903,50 @@
 
 
       try {
+        // 先检查 taste 是否需要生成/更新（带缓存）
+        if (selectedPlaylistId) {
+          const cache = tasteAnalysisCache[selectedPlaylistId];
+          const now = Date.now();
+          // 如果 10 分钟内已经分析过（无论成功失败），跳过
+          const shouldAnalyze = !cache || (now - cache.time > 10 * 60 * 1000);
+
+          if (shouldAnalyze) {
+            const select = document.getElementById('playlist-select');
+            const selected = select.options[select.selectedIndex];
+            const playlistName = selected?.textContent?.replace(/\s*\(\d+首\).*$/, '') || '';
+
+            updatePrepStatus('red', '分析音乐品味...');
+            try {
+              const tasteRes = await fetch('/api/analyze-taste', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  playlistId: selectedPlaylistId,
+                  playlistName,
+                  tracksHref: selectedPlaylistTracksHref
+                })
+              });
+
+              const tasteData = await tasteRes.json();
+              if (!tasteRes.ok || !tasteData.success) {
+                throw new Error(tasteData.error || 'Taste analysis failed');
+              }
+              tasteAnalysisCache[selectedPlaylistId] = { status: tasteData.updated ? 'done' : 'skipped', time: now };
+              if (tasteData.updated) {
+                console.log('Taste 分析完成', tasteData.trackCount);
+              }
+
+              // 竞态检测
+              if (prepCancelled || currentTrack.id !== prepSongId) return;
+            } catch (err) {
+              tasteAnalysisCache[selectedPlaylistId] = { status: 'failed', time: now };
+              console.error('Taste 分析失败，继续选歌:', err);
+            }
+          }
+        }
+
+        updatePrepStatus('red', '^_^');
+
         const res = await fetch('/api/select-next', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -908,7 +957,8 @@
               artist: currentTrack.artists.map(a => a.name).join(', ')
             },
             playlistId: selectedPlaylistId,
-            tracksHref: selectedPlaylistTracksHref
+            tracksHref: selectedPlaylistTracksHref,
+            useTaste: selectedPlaylistId ? tasteAnalysisCache[selectedPlaylistId]?.status !== 'failed' : false
           })
         });
 
@@ -960,7 +1010,9 @@
             nextTrack: {
               id: nextTrack.id,
               name: nextTrack.name,
-              artist: nextTrack.artist
+              artist: nextTrack.artist,
+              uri: nextTrack.uri,
+              albumArt: nextTrack.albumArt
             }
           })
         });
@@ -973,13 +1025,20 @@
 
         if (res.ok) {
           const data = await res.json();
-          preGeneratedTransition = {
-            nextTrack: selectedNextTrack,
-            speech: data.speech,
-            ttsAudioUrl: data.ttsAudioUrl
-          };
-          prepPhase = 'ready';
-          updatePrepStatus('green', selectedNextTrack.name);
+          if (data.ttsAudioUrl) {
+            preGeneratedTransition = {
+              nextTrack: selectedNextTrack,
+              speech: data.speech,
+              ttsAudioUrl: data.ttsAudioUrl,
+              songNameDelayMs: data.songNameDelayMs
+            };
+            prepPhase = 'ready';
+            updatePrepStatus('green', selectedNextTrack.name);
+          } else {
+            preGeneratedTransition = null;
+            prepPhase = 'speech-pending';
+            updatePrepStatus('yellow', selectedNextTrack.name);
+          }
 
         } else {
           console.error('generate-speech-tts 响应错误', res.status);
@@ -995,11 +1054,8 @@
 
     // 处理歌曲结束（三路径：绿灯/黄灯/红灯）
     async function handleTrackEnded(currentTrack) {
-
-      if (isPaused) {
-
-        return;
-      }
+      if (isPaused || trackEndingInProgress) return;
+      trackEndingInProgress = true;
 
       // 绿灯路径：预生成已完成，直接使用
       if (prepPhase === 'ready' && preGeneratedTransition) {
@@ -1012,10 +1068,14 @@
 
         if (transition.speech) addMessage(transition.speech);
         if (transition.ttsAudioUrl && transition.nextTrack) {
-          playTTSWithMusic(transition.ttsAudioUrl, transition.nextTrack);
+          // 标记正在处理切歌，防止新歌触发预生成
+          trackEndedHandled = true;
+          playTTSWithMusic(transition.ttsAudioUrl, transition.nextTrack, transition.songNameDelayMs);
         } else if (transition.nextTrack?.uri) {
-          playMusic(transition.nextTrack.uri);
+          trackEndedHandled = true;
+          playMusic(transition.nextTrack.uri, transition.nextTrack);
         }
+        trackEndingInProgress = false;
         return;
       }
 
@@ -1027,50 +1087,23 @@
         prepSongId = null;
         exitPreparationMode();
 
-        try {
-          const res = await fetch('/api/generate-speech-tts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              currentTrack: {
-                id: currentTrack.id,
-                name: currentTrack.name,
-                artist: currentTrack.artists.map(a => a.name).join(', ')
-              },
-              nextTrack: {
-                id: nextTrack.id,
-                name: nextTrack.name,
-                artist: nextTrack.artist
-              }
-            })
-          });
-
-          if (res.ok) {
-            const data = await res.json();
-            if (data.speech) addMessage(data.speech);
-            if (data.ttsAudioUrl) {
-              playTTSWithMusic(data.ttsAudioUrl, nextTrack);
-            } else if (nextTrack.uri) {
-              playMusic(nextTrack.uri);
-            }
-          } else {
-            if (nextTrack.uri) playMusic(nextTrack.uri);
-          }
-        } catch (err) {
-          console.error('黄灯路径即时生成失败:', err);
-          if (nextTrack.uri) playMusic(nextTrack.uri);
+        if (nextTrack.uri) {
+          trackEndedHandled = true;
+          playMusic(nextTrack.uri, nextTrack);
+          addMessage(`开始播放”${nextTrack.name}”`);
         }
+        trackEndingInProgress = false;
         return;
       }
 
-      // 红灯路径：无预生成，走 /api/auto-next 回退
+      // 红灯路径：无预生成，直接随机播放当前歌单下一首
       prepPhase = 'idle';
       selectedNextTrack = null;
       prepSongId = null;
       exitPreparationMode();
 
       try {
-        const res = await fetch('/api/auto-next', {
+        const res = await fetch('/api/next-track', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1087,6 +1120,7 @@
 
         if (!res.ok) {
           console.error('auto-next 请求失败', res.status);
+          trackEndingInProgress = false;
           return;
         }
 
@@ -1095,19 +1129,23 @@
 
         if (!data.nextTrack) {
           addMessage(data.speech || '没有找到下一首歌曲');
+          trackEndingInProgress = false;
           return;
         }
 
         if (data.speech) addMessage(data.speech);
 
         if (data.ttsAudioUrl) {
-          playTTSWithMusic(data.ttsAudioUrl, data.nextTrack);
+          trackEndedHandled = true;
+          playTTSWithMusic(data.ttsAudioUrl, data.nextTrack, data.songNameDelayMs);
         } else if (data.nextTrack?.uri) {
-          playMusic(data.nextTrack.uri);
+          trackEndedHandled = true;
+          playMusic(data.nextTrack.uri, data.nextTrack);
         }
       } catch (err) {
         console.error('auto-next 失败:', err);
       }
+      trackEndingInProgress = false;
     }
 
     function setStatus(node, text, type = '') {
@@ -1171,7 +1209,22 @@
         player.addListener('initialization_error', ({ message }) => showError('初始化错误: ' + message));
         player.addListener('authentication_error', ({ message }) => showError('认证错误: ' + message));
         player.addListener('account_error', ({ message }) => showError('账户错误: ' + message + '，需要 Spotify Premium'));
-        player.addListener('playback_error', ({ message }) => showError('播放错误: ' + message));
+        player.addListener('playback_error', ({ message }) => {
+          console.error('[Playback Error] 详细信息:', message);
+          console.error('[Playback Error] 当前状态:', { deviceId, isPlayerReady: !!player });
+
+          // DRM 错误自动重试
+          if (message.includes('widevine') || message.includes('license') || message.includes('DRM')) {
+            console.log('[Playback Error] 检测到 DRM 错误，尝试重新连接播放器...');
+            setTimeout(() => {
+              player.disconnect();
+              setTimeout(() => player.connect(), 1000);
+            }, 2000);
+            showError('DRM 许可证错误，正在重新连接...');
+          } else {
+            showError('播放错误: ' + message);
+          }
+        });
 
         player.addListener('ready', ({ device_id }) => {
           deviceId = device_id;
@@ -1243,9 +1296,9 @@
         // TTS 播放 + 音乐编排
         if (data.ttsAudioUrl) {
           if (player) player.pause();
-          playTTSWithMusic(data.ttsAudioUrl, data.track);
+          playTTSWithMusic(data.ttsAudioUrl, data.track, data.songNameDelayMs);
         } else if (data.track?.uri) {
-          playMusic(data.track.uri);
+          playMusic(data.track.uri, data.track);
         }
       } catch (err) {
         addMessage('发送失败: ' + err.message);
@@ -1255,45 +1308,108 @@
       }
     }
 
-    function playTTSWithMusic(ttsUrl, track) {
-
+    function playTTSWithMusic(ttsUrl, track, songNameDelayMs) {
       if (currentTTS) { currentTTS.pause(); currentTTS = null; }
 
       const audio = new Audio(ttsUrl);
       currentTTS = audio;
 
-      audio.play().then(() => {
+      let musicStarted = false;
 
-      }).catch((err) => {
+      // 静音当前播放（不暂停，避免干扰播放状态）
+      if (player) player.setVolume(0).catch(() => {});
+
+      // 定时器：歌名出现时小声开始播放下一首
+      let startMusicTimer = null;
+      if (songNameDelayMs > 0 && track?.uri) {
+        startMusicTimer = setTimeout(() => {
+          musicStarted = true;
+          startMusicQuiet(track.uri, track);
+        }, songNameDelayMs);
+      }
+
+      audio.play().catch((err) => {
         console.error('TTS 播放失败:', err);
         currentTTS = null;
-        if (track?.uri) playMusic(track.uri);
+        if (startMusicTimer) clearTimeout(startMusicTimer);
+        if (track?.uri) playMusic(track.uri, track);
       });
 
       audio.onended = () => {
-
         currentTTS = null;
-        if (track?.uri) playMusic(track.uri);
+        if (startMusicTimer) clearTimeout(startMusicTimer);
+        if (track?.uri) {
+          if (musicStarted) {
+            fadeInMusic();
+          } else {
+            playMusic(track.uri, track);
+          }
+        }
       };
 
       audio.onerror = (err) => {
         console.error('TTS 音频错误:', err);
         currentTTS = null;
-        if (track?.uri) playMusic(track.uri);
+        if (startMusicTimer) clearTimeout(startMusicTimer);
+        if (track?.uri) playMusic(track.uri, track);
       };
     }
 
-    async function playMusic(uri) {
+    async function playMusic(uri, track) {
       if (!uri) return;
       try {
-        await fetch('/api/play', {
+        // 恢复正常音量（TTS 播放时可能被静音）
+        if (player) player.setVolume(0.5).catch(() => {});
+        const body = { uri };
+        if (track) body.track = { id: track.id, name: track.name, artist: track.artist, albumArt: track.albumArt };
+        const response = await fetch('/api/play', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uri })
+          body: JSON.stringify(body)
         });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          console.error('播放API返回错误:', response.status, errorData);
+        }
       } catch (err) {
         console.error('播放音乐失败:', err);
       }
+    }
+
+    // 小声开始播放（歌名出现时调用）
+    async function startMusicQuiet(uri, track) {
+      try {
+        await player.setVolume(0.08);
+        const body = { uri };
+        if (track) body.track = { id: track.id, name: track.name, artist: track.artist, albumArt: track.albumArt };
+        const response = await fetch('/api/play', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          console.error('小声播放API返回错误:', response.status, errorData);
+        }
+      } catch (err) {
+        console.error('小声播放失败:', err);
+      }
+    }
+
+    // 渐变回正常音量
+    function fadeInMusic() {
+      const targetVol = 0.5;
+      const step = 0.05;
+      const interval = 200;
+      let vol = 0.08;
+
+      const timer = setInterval(async () => {
+        vol = Math.min(vol + step, targetVol);
+        try { await player.setVolume(vol); } catch (_) {}
+        if (vol >= targetVol) clearInterval(timer);
+      }, interval);
     }
 
     function togglePlay() {
@@ -1309,6 +1425,11 @@
       }
 
       if (player) {
+        // 未播放过任何歌曲时，触发切歌开始播放
+        if (!isPlaying && !isPaused) {
+          skipNext();
+          return;
+        }
         player.togglePlay();
       }
     }
@@ -1331,14 +1452,11 @@
           prepSongId = null;
           exitPreparationMode();
 
-          // 暂停当前音乐，避免与TTS语音重叠
-          if (player) player.pause();
-
           if (transition.speech) addMessage(transition.speech);
           if (transition.ttsAudioUrl && transition.nextTrack) {
-            playTTSWithMusic(transition.ttsAudioUrl, transition.nextTrack);
+            playTTSWithMusic(transition.ttsAudioUrl, transition.nextTrack, transition.songNameDelayMs);
           } else if (transition.nextTrack?.uri) {
-            playMusic(transition.nextTrack.uri);
+            playMusic(transition.nextTrack.uri, transition.nextTrack);
             addMessage(`正在播放：${transition.nextTrack.name} - ${transition.nextTrack.artist}`);
           }
           return;
@@ -1354,8 +1472,8 @@
           exitPreparationMode();
 
           if (nextTrack.uri) {
-            playMusic(nextTrack.uri);
-            addMessage(`正在播放：${nextTrack.name} - ${nextTrack.artist}`);
+            playMusic(nextTrack.uri, nextTrack);
+            addMessage(`开始播放“${nextTrack.name}”`);
           }
           return;
         }
@@ -1394,7 +1512,7 @@
         const data = await res.json();
 
         if (data.nextTrack?.uri) {
-          playMusic(data.nextTrack.uri);
+          playMusic(data.nextTrack.uri, data.nextTrack);
           addMessage(`正在播放：${data.nextTrack.name} - ${data.nextTrack.artist}`);
         } else {
           addMessage('没有下一首歌曲了');

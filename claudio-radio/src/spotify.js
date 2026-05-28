@@ -4,6 +4,49 @@ import { logger } from './logger.js';
 let accessToken = null;
 let tokenExpiry = 0;
 
+// 带重试的 fetch 包装函数（指数退避 + jitter）
+export async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+
+      // 503 或 429 时重试
+      if ((response.status === 503 || response.status === 429) && attempt < maxRetries) {
+        const retryAfter = response.headers.get('Retry-After');
+        const baseWait = retryAfter ? parseInt(retryAfter) : Math.pow(2, attempt);
+        const jitter = Math.random() * 1000; // 0-1s 随机抖动
+        const waitMs = baseWait * 1000 + jitter;
+
+        logger.warn('Spotify API 临时不可用，准备重试', {
+          status: response.status,
+          attempt: attempt + 1,
+          maxRetries,
+          waitMs: Math.round(waitMs)
+        });
+
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+        continue;
+      }
+
+      return response;
+    } catch (err) {
+      // 网络错误时重试
+      if (attempt < maxRetries) {
+        const waitMs = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+        logger.warn('Spotify API 网络错误，准备重试', {
+          error: err.message,
+          attempt: attempt + 1,
+          maxRetries,
+          waitMs: Math.round(waitMs)
+        });
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function getAccessToken() {
   if (accessToken && Date.now() < tokenExpiry) {
     return accessToken;
@@ -84,7 +127,7 @@ export async function getPlaylistTracks(playlistId) {
 }
 
 // 获取用户歌单列表（需要用户token）
-async function readSpotifyError(response) {
+export async function readSpotifyError(response) {
   const text = await response.text();
   try {
     const data = JSON.parse(text);
@@ -107,7 +150,7 @@ function extractTrackCount(tracks) {
 }
 
 export async function getUserPlaylists(userToken) {
-  const response = await fetch('https://api.spotify.com/v1/me/playlists?limit=50', {
+  const response = await fetchWithRetry('https://api.spotify.com/v1/me/playlists?limit=50', {
     headers: { Authorization: `Bearer ${userToken}` }
   });
   if (!response.ok) {
@@ -186,7 +229,7 @@ export async function getUserPlaylistTracks(userToken, playlistId, tracksHref = 
   if (tracksHref.includes('/me/tracks')) {
     return getLikedSongs(userToken);
   }
-  const response = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/items?limit=50&additional_types=track`, {
+  const response = await fetchWithRetry(`https://api.spotify.com/v1/playlists/${playlistId}/items?limit=50&additional_types=track`, {
     headers: { Authorization: `Bearer ${userToken}` }
   });
   if (!response.ok) {
@@ -206,8 +249,99 @@ export async function getUserPlaylistTracks(userToken, playlistId, tracksHref = 
   return tracks;
 }
 
+// 分页获取整个歌单的歌曲（上限 500 首）
+export async function getAllPlaylistTracks(userToken, playlistId, tracksHref = '', maxTracks = 500) {
+  // 检测是否为 Liked Songs
+  if (tracksHref.includes('/me/tracks')) {
+    return getAllLikedSongs(userToken, maxTracks);
+  }
+
+  const allTracks = [];
+  let offset = 0;
+  const limit = 50;
+  let total = 0;
+
+  while (allTracks.length < maxTracks) {
+    const url = `https://api.spotify.com/v1/playlists/${playlistId}/items?limit=${limit}&offset=${offset}&additional_types=track`;
+    const response = await fetchWithRetry(url, {
+      headers: { Authorization: `Bearer ${userToken}` }
+    });
+
+    if (!response.ok) {
+      const detail = await readSpotifyError(response);
+      logger.error('分页获取歌单失败', { status: response.status, detail, playlistId, offset });
+      throw new Error(`分页获取歌单失败 (${response.status})`);
+    }
+
+    const data = await response.json();
+    total = data.total || 0;
+
+    if (!data.items || data.items.length === 0) break;
+
+    const tracks = mapPlaylistItems(data.items);
+    allTracks.push(...tracks);
+
+    // 如果已经获取完所有歌曲，退出
+    if (allTracks.length >= total || data.next === null) break;
+
+    offset += limit;
+  }
+
+  const result = allTracks.slice(0, maxTracks);
+  logger.info('歌单全量获取完成', { playlistId, total, fetched: result.length, maxTracks });
+  return { tracks: result, total };
+}
+
+// 分页获取用户喜欢的歌曲（上限 500 首）
+async function getAllLikedSongs(userToken, maxTracks = 500) {
+  const allTracks = [];
+  let offset = 0;
+  const limit = 50;
+  let total = 0;
+
+  while (allTracks.length < maxTracks) {
+    const url = `https://api.spotify.com/v1/me/tracks?limit=${limit}&offset=${offset}`;
+    const response = await fetchWithRetry(url, {
+      headers: { Authorization: `Bearer ${userToken}` }
+    });
+
+    if (!response.ok) {
+      const detail = await readSpotifyError(response);
+      logger.error('分页获取喜欢歌曲失败', { status: response.status, detail, offset });
+      throw new Error(`分页获取喜欢歌曲失败 (${response.status})`);
+    }
+
+    const data = await response.json();
+    total = data.total || 0;
+
+    if (!data.items || data.items.length === 0) break;
+
+    const tracks = (data.items || [])
+      .filter(item => item?.track?.type === 'track' && item.track.id && item.track.uri)
+      .map(item => ({
+        id: item.track.id,
+        name: item.track.name,
+        artist: item.track.artists?.map(a => a.name).join(', ') || '未知艺术家',
+        album: item.track.album?.name || '',
+        albumArt: item.track.album?.images?.[0]?.url,
+        previewUrl: item.track.preview_url,
+        uri: item.track.uri,
+      }));
+
+    allTracks.push(...tracks);
+
+    if (allTracks.length >= total || data.next === null) break;
+
+    offset += limit;
+  }
+
+  const result = allTracks.slice(0, maxTracks);
+  logger.info('喜欢歌曲全量获取完成', { total, fetched: result.length, maxTracks });
+  return { tracks: result, total };
+}
+
 export async function getLikedSongs(userToken) {
-  const response = await fetch('https://api.spotify.com/v1/me/tracks?limit=50', {
+  const response = await fetchWithRetry('https://api.spotify.com/v1/me/tracks?limit=50', {
     headers: { Authorization: `Bearer ${userToken}` }
   });
   if (!response.ok) {
@@ -244,4 +378,32 @@ function mapPlaylistItems(items = []) {
       previewUrl: track.preview_url,
       uri: track.uri,
     }));
+}
+
+// 批量获取歌曲的 audio features（最多 100 首/次）
+export async function getAudioFeatures(trackIds, userToken) {
+  const token = userToken || await getAccessToken();
+  const results = [];
+
+  // 分批处理，每批最多 100 首
+  for (let i = 0; i < trackIds.length; i += 100) {
+    const batch = trackIds.slice(i, i + 100);
+    const response = await fetch(`https://api.spotify.com/v1/audio-features?ids=${batch.join(',')}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    if (!response.ok) {
+      const detail = await readSpotifyError(response);
+      logger.error('获取 audio features 失败', { status: response.status, detail });
+      throw new Error(`获取 audio features 失败 (${response.status})`);
+    }
+
+    const data = await response.json();
+    if (data.audio_features) {
+      results.push(...data.audio_features.filter(Boolean));
+    }
+  }
+
+  logger.info('Audio features 获取完成', { total: results.length });
+  return results;
 }

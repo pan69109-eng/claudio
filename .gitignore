@@ -25,6 +25,20 @@ db/
 *.svg
 *.webp
 
+# 用户数据（品味分析、运行时缓存）
+claudio-radio/data/taste.md
+claudio-radio/data/taste-meta.json
+claudio-radio/user/
+
+# Claude Code 配置
+.claude/
+
+# 内部文档
+Claudio改进实施说明书.md
+Claudio核心模块实现计划.md
+TTS项目报告.md
+好的样的/
+
 # 其他
 *.log
 *.tmp

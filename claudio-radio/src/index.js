@@ -6,12 +6,15 @@ import fs from 'fs';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { errorHandler } from './errorHandler.js';
-import { initDb, saveMessage, savePlay, getRecentPlays, getNextTrack, getPreviousTrack, clearPlayHistory, clearMessages, savePlaylistPreference, getPlaylistPreference, setCurrentTrackByUri, setCurrentTrackById } from './db.js';
+import { initDb, saveMessage, getMessages, savePlay, getRecentPlays, getNextTrack, getPreviousTrack, clearPlayHistory, clearMessages, savePlaylistPreference, getPlaylistPreference, setCurrentTrackByUri, setCurrentTrackById } from './db.js';
 import { route } from './router.js';
 import { buildContext } from './context.js';
 import { ask } from './llm.js';
-import { searchTracks, getPlaylistTracks, getUserPlaylists, getUserPlaylistTracks } from './spotify.js';
+import { compute } from './brain.js';
+import { searchTracks, getPlaylistTracks, getUserPlaylists, getUserPlaylistTracks, getAllPlaylistTracks } from './music/index.js';
+import { fetchWithRetry, readSpotifyError } from './spotify.js';
 import { TTSPipeline } from './tts.js';
+import { getWeather } from './weather.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -25,6 +28,14 @@ let userAccessToken = null;
 let userRefreshToken = null;
 let userTokenExpiry = 0;
 let deviceId = null;
+let lastTransitionTime = null; // 上次过渡词生成时间，用于整点提醒
+let cachedPlaylistId = null;
+let cachedTracks = [];        // 缓存的全量歌单（上限500首）
+
+// 天气状态
+let lastWeather = null; // 上次获取的天气数据
+let lastWeatherTime = 0; // 上次获取天气的时间
+let isFirstPlay = true; // 是否是首次播放
 
 const REDIRECT_URI = `http://127.0.0.1:${config.app.port}/auth/callback`;
 const SCOPES = [
@@ -131,25 +142,10 @@ app.post('/api/device-ready', (req, res) => {
   res.json({ success: true });
 });
 
-// 播放状态更新
-app.post('/api/playback-state', (req, res) => {
-  logger.info('播放状态更新', req.body);
-  res.json({ success: true });
-});
-
-// 播放器状态
-app.get('/api/player-status', (req, res) => {
-  res.json({
-    deviceId,
-    ready: !!deviceId,
-    loggedIn: !!userAccessToken
-  });
-});
-
 // 播放歌曲API
 app.post('/api/play', async (req, res) => {
   try {
-    const { uri, historyId } = req.body;
+    const { uri, historyId, track } = req.body;
     if (!deviceId) {
       return res.status(400).json({ error: '播放器未就绪' });
     }
@@ -157,10 +153,13 @@ app.post('/api/play', async (req, res) => {
     const historyTrack = setCurrentTrackById(historyId) || (uri ? setCurrentTrackByUri(uri) : null);
     if (historyTrack) {
       logger.info('播放历史歌曲，已同步历史游标', { track: historyTrack.track_name, uri });
+    } else if (track && uri) {
+      // 新歌曲首次播放，保存到播放历史
+      savePlay({ id: track.id, name: track.name, artist: track.artist, uri, albumArt: track.albumArt });
     }
 
     const token = await getUserToken();
-    const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+    const response = await fetchWithRetry(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
       method: 'PUT',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -170,8 +169,8 @@ app.post('/api/play', async (req, res) => {
     });
 
     if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.error?.message || '播放失败');
+      const detail = await readSpotifyError(response);
+      throw new Error(detail || '播放失败');
     }
 
     logger.info('播放命令已发送', { uri });
@@ -255,7 +254,7 @@ app.post('/api/chat', async (req, res) => {
 app.get('/api/user-playlists', async (req, res) => {
   try {
     const userToken = await getUserToken();
-    const playlists = await getUserPlaylists(userToken);
+    const playlists = await getUserPlaylists({ userToken });
     if (playlists.some(p => !p.trackCount)) {
       logger.warn('部分歌单 trackCount 为 0', {
         samples: playlists.filter(p => !p.trackCount).slice(0, 3).map(p => ({ id: p.id, name: p.name }))
@@ -268,26 +267,143 @@ app.get('/api/user-playlists', async (req, res) => {
   }
 });
 
-app.get('/api/user-playlists/:playlistId/tracks', async (req, res) => {
+// 分析用户音乐品味
+app.post('/api/analyze-taste', async (req, res) => {
   try {
+    const { playlistId, playlistName, tracksHref, force } = req.body;
     const userToken = await getUserToken();
-    const tracksHref = req.query.tracksHref || '';
-    const tracks = await getUserPlaylistTracks(userToken, req.params.playlistId, tracksHref);
-    res.json({
-      count: tracks.length,
-      sample: tracks.slice(0, 10)
+
+    // 1. 检查是否需要更新
+    const metaPath = join(__dirname, '../data/taste-meta.json');
+    const tastePath = join(__dirname, '../data/taste.md');
+
+    const tasteExists = fs.existsSync(tastePath) && fs.readFileSync(tastePath, 'utf-8').trim().length > 0;
+    if (!force && fs.existsSync(metaPath) && tasteExists) {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      const daysSinceUpdate = (Date.now() - meta.updatedAt) / (1000 * 60 * 60 * 24);
+
+      // 先获取当前歌单总数
+      const { total: currentTotal } = await getAllPlaylistTracks(playlistId, {
+        userToken, tracksHref, maxTracks: 1
+      });
+
+      const trackCountDiff = Math.abs(currentTotal - meta.trackCount);
+      const needsUpdate = meta.playlistId !== playlistId || trackCountDiff > 10 || daysSinceUpdate > 10;
+
+      if (!needsUpdate) {
+        logger.info('Taste 无需更新', {
+          playlistId,
+          savedTrackCount: meta.trackCount,
+          currentTotal,
+          daysSinceUpdate: Math.round(daysSinceUpdate)
+        });
+        const taste = fs.readFileSync(tastePath, 'utf-8');
+        return res.json({
+          success: true,
+          updated: false,
+          reason: '无需更新',
+          trackCount: meta.trackCount,
+          taste
+        });
+      }
+
+      logger.info('Taste 需要更新', {
+        playlistId,
+        trackCountDiff,
+        daysSinceUpdate: Math.round(daysSinceUpdate)
+      });
+    }
+
+    // 2. 分页获取整个歌单（上限 500 首）
+    const { tracks, total } = await getAllPlaylistTracks(playlistId, {
+      userToken, tracksHref, maxTracks: 500
     });
+
+    if (tracks.length === 0) {
+      return res.status(400).json({ error: '歌单为空' });
+    }
+
+    logger.info('开始分析音乐品味', { playlistId, trackCount: tracks.length, totalInPlaylist: total });
+
+    // 3. 基于歌曲元数据的 LLM 品味分析
+    try {
+      const songList = tracks.map((t, i) => `${i + 1}. ${t.name} - ${t.artist}（专辑：${t.album}）`).join('\n');
+
+      const prompt = `你是一位专业的音乐数据分析师。请根据以下 ${tracks.length} 首歌曲的列表（歌名、艺术家、专辑），分析用户的音乐品味画像。
+
+## 歌曲列表
+${songList}
+
+## 请生成以下维度的分析（markdown 格式）
+
+### 1. 整体画像（1-2句话总结）
+
+### 2. 艺术家偏好
+- 出现频率最高的艺术家 TOP10
+- 艺术家集中度分析
+
+### 3. 曲风推断
+- 根据艺术家和歌名推断主要曲风
+- 是否偏向华语流行/摇滚/电子/嘻哈/R&B/民谣/ACG等
+
+### 4. 地域/语言特征
+- 是否偏好华语/英语/日韩等特定语言音乐
+
+### 5. 情绪/氛围推断
+- 整体情绪基调
+- 偏好：安静/动感/激烈/治愈等
+
+### 6. 风格标签（3-5个关键词）
+
+### 7. 选歌建议
+基于以上画像，给出 3-5 条选歌策略
+
+只返回分析结果，不要输出其他文字。`;
+
+      const context = {
+        systemPrompt: '你是一位专业的音乐数据分析师，擅长从歌曲元信息中推断用户的音乐品味。请用中文回答，分析要详尽专业。'
+      };
+      const result = await ask(prompt, context);
+
+      const tasteContent = `# 音乐品味画像
+
+> 基于歌单「${playlistName || '未知歌单'}」${tracks.length} 首歌曲分析
+
+${result.speech || result}
+
+---
+*更新时间：${new Date().toLocaleString('zh-CN')}*
+*歌曲总数：${total} 首（分析 ${tracks.length} 首）*`;
+
+      fs.writeFileSync(tastePath, tasteContent, 'utf-8');
+
+      const meta = {
+        playlistId,
+        playlistName: playlistName || '未知歌单',
+        trackCount: total,
+        analyzedCount: tracks.length,
+        updatedAt: Date.now()
+      };
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+
+      logger.info('音乐品味分析完成', { playlistId, trackCount: tracks.length, total });
+      res.json({ success: true, updated: true, trackCount: tracks.length, taste: tasteContent });
+    } catch (tasteErr) {
+      logger.warn('音乐品味分析失败，跳过 taste', { error: tasteErr.message });
+      res.json({ success: true, updated: false, reason: tasteErr.message, trackCount: tracks.length });
+    }
   } catch (err) {
-    logger.error('诊断歌单歌曲读取失败', { error: err.message, playlistId: req.params.playlistId });
-    res.status(500).json({ error: err.message, playlistId: req.params.playlistId });
+    logger.error('分析音乐品味失败', { error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // 预生成阶段1：仅选歌（不生成过渡词/TTS）
 app.post('/api/select-next', async (req, res) => {
   try {
-    const { currentTrack, playlistId, tracksHref } = req.body;
-    let nextTrack = await selectNextTrackForTransition(currentTrack, playlistId, tracksHref || '');
+    const { currentTrack, playlistId, tracksHref, useTaste = true } = req.body;
+    const recentChats = getMessages(5);
+    let nextTrack = await selectNextTrackForTransition(currentTrack, playlistId, tracksHref || '', recentChats, { useTaste });
 
     if (!nextTrack) {
       const searchQuery = currentTrack?.artist || 'popular';
@@ -309,8 +425,9 @@ app.post('/api/select-next', async (req, res) => {
 app.post('/api/generate-speech-tts', async (req, res) => {
   try {
     const { currentTrack, nextTrack } = req.body;
-    const { speech, ttsAudioUrl } = await generateTransitionSpeech(currentTrack, nextTrack);
-    res.json({ speech, ttsAudioUrl });
+    const { speech, ttsAudioUrl, songNameDelayMs } = await generateTransitionSpeech(currentTrack, nextTrack);
+
+    res.json({ speech, ttsAudioUrl, songNameDelayMs });
   } catch (err) {
     logger.error('generate-speech-tts失败', { error: err.message });
     res.status(500).json({ error: err.message });
@@ -322,18 +439,17 @@ app.post('/api/next-track', async (req, res) => {
   try {
     const { currentTrack, playlistId, tracksHref } = req.body;
 
-    let nextTrack = getNextTrack();
-    let shouldSavePlay = false;
-
-    if (nextTrack?.uri) {
-      logger.info('下一首使用播放历史中的实际下一首', { track: nextTrack.track_name, uri: nextTrack.uri });
+    // 1. 先检查历史中是否有下一首
+    const historyNext = getNextTrack();
+    if (historyNext?.uri) {
+      logger.info('下一首使用播放历史中的下一首', { track: historyNext.track_name, uri: historyNext.uri });
       return res.json({
         nextTrack: {
-          id: nextTrack.track_id,
-          name: nextTrack.track_name,
-          artist: nextTrack.artist,
-          albumArt: nextTrack.albumArt,
-          uri: nextTrack.uri
+          id: historyNext.track_id,
+          name: historyNext.track_name,
+          artist: historyNext.artist,
+          albumArt: historyNext.albumArt,
+          uri: historyNext.uri
         },
         speech: null,
         ttsAudioUrl: null,
@@ -342,18 +458,23 @@ app.post('/api/next-track', async (req, res) => {
       });
     }
 
-    nextTrack = null;
+    let nextTrack = null;
+    let source = 'none';
 
-    // 1. 历史中没有合理的下一首时，从用户歌单中随机抽取
+    // 2. 历史中没有下一首时，从用户歌单中随机抽取
     if (playlistId) {
       try {
         const userToken = await getUserToken();
-        const tracks = await getUserPlaylistTracks(userToken, playlistId, tracksHref || '');
+        const tracks = await getUserPlaylistTracks(playlistId, { userToken, tracksHref: tracksHref || '' });
         logger.info('手动下一首读取歌单成功', { playlistId, count: tracks.length });
         if (tracks.length > 0) {
-          const filtered = tracks.filter(t => t.id !== currentTrack?.id);
-          nextTrack = (filtered.length > 0 ? filtered : tracks)[Math.floor(Math.random() * (filtered.length > 0 ? filtered.length : tracks.length))];
-          shouldSavePlay = true;
+          const recentIds = new Set(getRecentPlays(10).map(t => t.track_id));
+          if (currentTrack?.id) recentIds.add(currentTrack.id);
+          const filtered = tracks.filter(t => !recentIds.has(t.id));
+          const pool = filtered.length > 0 ? filtered : tracks.filter(t => t.id !== currentTrack?.id);
+          const candidates = pool.length > 0 ? pool : tracks;
+          nextTrack = candidates[Math.floor(Math.random() * candidates.length)];
+          source = 'playlist-random';
         }
       } catch (e) {
         logger.warn('手动下一首读取选定歌单失败', { error: e.message, playlistId });
@@ -368,19 +489,21 @@ app.post('/api/next-track', async (req, res) => {
       }
     }
 
-    // 2. 如果没有选定歌单，再降级到搜索
+    // 3. 如果没有选定歌单，再降级到搜索
     if (!nextTrack) {
       const searchQuery = currentTrack?.artist || 'popular';
       const tracks = await searchTracks(searchQuery);
-      const filtered = tracks.filter(t => t.id !== currentTrack?.id);
+      const recentIds = new Set(getRecentPlays(10).map(t => t.track_id));
+      if (currentTrack?.id) recentIds.add(currentTrack.id);
+      const filtered = tracks.filter(t => !recentIds.has(t.id));
       if (filtered.length > 0) {
         nextTrack = filtered[Math.floor(Math.random() * filtered.length)];
-        shouldSavePlay = true;
+        source = 'search-random';
       }
     }
 
-    // 3. 只有新挑选的歌曲才追加到播放历史；历史中的下一首只移动游标，不重复入库
-    if (nextTrack && shouldSavePlay) {
+    // 4. 只有新挑选的歌曲才追加到播放历史
+    if (nextTrack) {
       savePlay(nextTrack);
     }
 
@@ -389,7 +512,7 @@ app.post('/api/next-track', async (req, res) => {
       speech: null,
       ttsAudioUrl: null,
       ready: true,
-      source: shouldSavePlay ? 'random' : 'none'
+      source
     });
   } catch (err) {
     logger.error('获取下一首歌失败', { error: err.message });
@@ -404,8 +527,6 @@ app.post('/api/auto-next', async (req, res) => {
 
     // 如果有预生成的数据，直接使用
     if (preGenerated && preGenerated.nextTrack) {
-      // 保存播放记录
-      savePlay(preGenerated.nextTrack);
       res.json({
         nextTrack: preGenerated.nextTrack,
         speech: preGenerated.speech || null,
@@ -416,7 +537,8 @@ app.post('/api/auto-next', async (req, res) => {
     }
 
     // 1. 由大模型判断下一首适合的歌，再从用户歌单中挑选
-    let nextTrack = await selectNextTrackForTransition(currentTrack, playlistId, tracksHref || '');
+    const recentChats = getMessages(5);
+    let nextTrack = await selectNextTrackForTransition(currentTrack, playlistId, tracksHref || '', recentChats);
     logger.info('auto-next 开始', { playlistId, hasToken: !!userAccessToken });
     if (!playlistId) {
       logger.info('auto-next: 未选择歌单，使用搜索');
@@ -425,7 +547,9 @@ app.post('/api/auto-next', async (req, res) => {
     if (!nextTrack) {
       const searchQuery = currentTrack?.artist || 'popular';
       const tracks = await searchTracks(searchQuery);
-      const filtered = tracks.filter(t => t.id !== currentTrack?.id);
+      const recentIds = new Set(getRecentPlays(10).map(t => t.track_id));
+      if (currentTrack?.id) recentIds.add(currentTrack.id);
+      const filtered = tracks.filter(t => !recentIds.has(t.id));
       if (filtered.length > 0) {
         nextTrack = filtered[Math.floor(Math.random() * filtered.length)];
       }
@@ -436,15 +560,13 @@ app.post('/api/auto-next', async (req, res) => {
     }
 
     // 2. 生成过渡词 + TTS
-    const { speech, ttsAudioUrl } = await generateTransitionSpeech(currentTrack, nextTrack);
-
-    // 3. 保存播放记录
-    savePlay(nextTrack);
+    const { speech, ttsAudioUrl, songNameDelayMs } = await generateTransitionSpeech(currentTrack, nextTrack);
 
     res.json({
       nextTrack,
       speech,
       ttsAudioUrl,
+      songNameDelayMs,
       ready: true
     });
   } catch (err) {
@@ -454,20 +576,134 @@ app.post('/api/auto-next', async (req, res) => {
 });
 
 // 生成过渡词 + TTS（共享函数）
+// 搜索下一首歌的创作背景（Spotify 元数据 + LLM 知识）
+async function researchTrackBackground(track) {
+  if (!track?.name) return '';
+
+  const parts = [];
+
+  // 1. 从 Spotify 获取专辑详情
+  try {
+    const token = await getUserToken();
+    const res = await fetchWithRetry(`https://api.spotify.com/v1/tracks/${track.id}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const album = data.album;
+      if (album?.name) parts.push(`专辑：${album.name}`);
+      if (album?.release_date) parts.push(`发行日期：${album.release_date}`);
+      if (data.popularity) parts.push(`流行度：${data.popularity}/100`);
+      if (data.explicit) parts.push('含显式内容');
+    }
+  } catch (_) {}
+
+  // 2. 用 LLM 搜索创作背景
+  try {
+    const bgPrompt = `请用2-3句话简要介绍这首歌的创作背景或歌手故事，要求有画面感和趣味性，适合电台DJ口播：
+歌曲：${track.name}
+歌手：${track.artist}
+${parts.length > 0 ? '已知信息：' + parts.join('、') : ''}
+
+只返回介绍文字，不要标题或格式。`;
+
+    const bgResponse = await ask(bgPrompt, {
+      systemPrompt: '你是音乐知识库，擅长用简洁生动的语言介绍歌曲背景。只输出纯文本介绍，不加任何格式。'
+    });
+
+    const bgText = typeof bgResponse === 'string'
+      ? bgResponse
+      : bgResponse.speech || bgResponse.text || JSON.stringify(bgResponse);
+
+    if (bgText && bgText.length > 10) {
+      parts.push(`背景：${bgText.substring(0, 200)}`);
+    }
+  } catch (_) {}
+
+  return parts.join('\n');
+}
+
 async function generateTransitionSpeech(currentTrack, nextTrack) {
   const recentHistory = getRecentPlays(5);
-  const envContext = { time: new Date().toLocaleTimeString('zh-CN') };
+
+  // 天气逻辑：首次播放强制包含，之后每小时检查一次，有变化才包含
+  const now = new Date();
+  let weatherStr = '';
+  let shouldIncludeWeather = false;
+
+  if (isFirstPlay) {
+    // 首次播放：强制包含天气
+    shouldIncludeWeather = true;
+    isFirstPlay = false;
+  } else {
+    // 检查是否需要更新天气（每小时）
+    const hoursSinceLastWeather = (now.getTime() - lastWeatherTime) / (1000 * 60 * 60);
+    if (hoursSinceLastWeather >= 1) {
+      const weatherData = await getWeather();
+      const newWeatherStr = weatherData.tempC !== null
+        ? `${weatherData.city} ${weatherData.tempC}°C，${weatherData.condition}`
+        : '';
+
+      // 天气有变化才包含
+      if (newWeatherStr && newWeatherStr !== lastWeather) {
+        shouldIncludeWeather = true;
+        lastWeather = newWeatherStr;
+        lastWeatherTime = now.getTime();
+        weatherStr = newWeatherStr;
+      }
+    }
+  }
+
+  // 首次播放时获取天气
+  if (shouldIncludeWeather && !weatherStr) {
+    const weatherData = await getWeather();
+    weatherStr = weatherData.tempC !== null
+      ? `${weatherData.city} ${weatherData.tempC}°C，${weatherData.condition}`
+      : '天气未配置';
+    lastWeather = weatherStr;
+    lastWeatherTime = now.getTime();
+  }
+
+  const envContext = {
+    time: now.toLocaleTimeString('zh-CN'),
+    weather: shouldIncludeWeather ? weatherStr : '天气未配置',
+  };
   const { systemPrompt } = buildContext('', envContext, recentHistory);
+
+  // 搜索下一首歌的创作背景
+  const nextTrackBg = await researchTrackBackground(nextTrack);
+
+  // 检测是否跨越整点
+  const currentHour = now.getHours();
+  let timeReminder = '';
+  if (lastTransitionTime !== null) {
+    const lastHour = new Date(lastTransitionTime).getHours();
+    if (currentHour !== lastHour) {
+      const hourStr = currentHour === 0 ? '凌晨12点' :
+        currentHour < 6 ? `凌晨${currentHour}点` :
+        currentHour < 12 ? `早上${currentHour}点` :
+        currentHour === 12 ? '中午12点' :
+        currentHour < 18 ? `下午${currentHour}点` :
+        currentHour < 22 ? `晚上${currentHour}点` : `深夜${currentHour}点`;
+      timeReminder = `\n【整点提醒】现在刚到${hourStr}，请在过渡词中自然地加入时间提醒，用温暖口语化的语气，比如"不知不觉已经${hourStr}了"、"夜深了，注意休息"等，要有人情味和亲和力，不要生硬。\n`;
+    }
+  }
+  lastTransitionTime = now.toISOString();
+
+  const weatherReminder = shouldIncludeWeather
+    ? `\n【天气信息】当前天气：${weatherStr}，请在过渡词中自然地提及天气，用温暖的语气关心听众，比如"外面下着雨，适合听这样的歌"、"今天天气不错，来首轻松的歌"等。\n`
+    : '';
 
   const llmPrompt = `当前歌曲刚播放完毕：${currentTrack?.name || '未知'} - ${currentTrack?.artist || '未知'}
 下一首歌曲：${nextTrack?.name || '未知'} - ${nextTrack?.artist || '未知'}
-
+${nextTrackBg ? `\n下一首歌的背景资料：\n${nextTrackBg}\n` : ''}${timeReminder}${weatherReminder}
 请作为电台DJ，用温暖自然的语气：
 1. 简短总结上一首歌（1-2句话）
 2. 生成过渡词，自然地引出下一首歌
-3. 介绍下一首歌的特点或亮点
+3. 融入下一首歌的创作背景或歌手故事，增加沉浸感
+4. 提及下一首歌名时请用《》书名号包裹，例如"接下来为你送上《晴天》"
 
-回复要简洁，控制在3-4句话，有陪伴感。`;
+回复要简洁，控制在3-4句话，有陪伴感和画面感。`;
 
   let speech = '';
   try {
@@ -493,96 +729,135 @@ async function generateTransitionSpeech(currentTrack, nextTrack) {
     }
   }
 
-  return { speech, ttsAudioUrl };
-}
-
-async function selectNextTrackForTransition(currentTrack, playlistId, tracksHref = '') {
-  if (!playlistId) return null;
-
-  // 1. 先拉歌单曲目（不依赖LLM）
-  let tracks;
-  try {
-    const userToken = await getUserToken();
-    tracks = await getUserPlaylistTracks(userToken, playlistId, tracksHref);
-    logger.info('大模型选歌：获取歌单歌曲成功', { playlistId, count: tracks.length });
-  } catch (e) {
-    logger.warn('大模型选歌：获取歌单失败', { error: e.message, playlistId });
-    return null;
+  // 计算歌名在语音中的时间点（找第二个》，即下一首歌名的结束位置）
+  let songNameDelayMs = null;
+  const firstBracket = speech.indexOf('》');
+  const secondBracket = firstBracket > 0 ? speech.indexOf('》', firstBracket + 1) : -1;
+  const bracketIdx = secondBracket > 0 ? secondBracket : firstBracket;
+  if (bracketIdx > 0) {
+    // 中文 TTS 语速约 4 字/秒，预留 0.3s 缓冲
+    songNameDelayMs = Math.max(0, Math.round(bracketIdx / 4 * 1000) - 300);
   }
 
-  if (!tracks || tracks.length === 0) return null;
+  const firstTitleEnd = speech.indexOf('\u300b');
+  const secondTitleEnd = firstTitleEnd >= 0 ? speech.indexOf('\u300b', firstTitleEnd + 1) : -1;
+  const titleEnd = secondTitleEnd >= 0 ? secondTitleEnd : firstTitleEnd;
+  if (titleEnd >= 0) {
+    songNameDelayMs = Math.max(0, Math.round(titleEnd / 4 * 1000) - 300);
+  }
 
-  const candidates = [...tracks]
-    .filter(t => t.id !== currentTrack?.id)
-    .sort(() => Math.random() - 0.5)
-    .slice(0, 60);
+  return { speech, ttsAudioUrl, songNameDelayMs };
+}
 
+async function selectNextTrackForTransition(currentTrack, playlistId, tracksHref = '', recentChats = [], options = {}) {
+  if (!playlistId) return null;
+
+  // 1. 缓存全量歌单（仅首次或歌单切换时获取）
+  if (cachedPlaylistId !== playlistId || cachedTracks.length === 0) {
+    try {
+      const userToken = await getUserToken();
+      const result = await getAllPlaylistTracks(playlistId, { userToken, tracksHref, maxTracks: 500 });
+      cachedTracks = result.tracks;
+      cachedPlaylistId = playlistId;
+      logger.info('大模型选歌：获取全量歌单成功', { playlistId, count: cachedTracks.length });
+    } catch (e) {
+      logger.warn('大模型选歌：获取歌单失败', { error: e.message, playlistId });
+      return null;
+    }
+  }
+  if (cachedTracks.length === 0) return null;
+
+  // 2. 排除最近播放的歌曲，构建可用歌曲列表
+  const recentIds = new Set(getRecentPlays(15).map(t => t.track_id));
+  if (currentTrack?.id) recentIds.add(currentTrack.id);
+  const availableTracks = cachedTracks.filter(t => !recentIds.has(t.id));
+
+  // 如果可用歌曲为空，降级使用全量歌单
+  const candidates = availableTracks.length > 0 ? availableTracks : cachedTracks;
   if (candidates.length === 0) return null;
 
-  // 2. 尝试LLM选歌，失败就随机
+  // 3. 尝试 LLM 选歌
   try {
     const candidateText = candidates
       .map((track, index) => `${index + 1}. id=${track.id} | ${track.name} - ${track.artist}`)
       .join('\n');
 
+    // 构建最近对话摘要
+    const chatSummary = recentChats.length > 0
+      ? recentChats.map(m => `[${m.role}] ${m.content.substring(0, 100)}`).join('\n')
+      : '暂无对话记录';
+
+    // 构建最近播放历史
+    const recentHistory = getRecentPlays(10);
+    const historySummary = recentHistory.length > 0
+      ? recentHistory.map(t => `${t.track_name} - ${t.artist}`).join('\n')
+      : '暂无播放记录';
+
+    // 读取用户口味偏好
+    let tasteSummary = '暂无口味数据';
+    try {
+      const dataPath = join(__dirname, '../data/taste.md');
+      const metaPath = join(__dirname, '../data/taste-meta.json');
+      if (options.useTaste !== false && fs.existsSync(dataPath) && fs.existsSync(metaPath)) {
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+        if (meta.playlistId === playlistId) {
+          tasteSummary = fs.readFileSync(dataPath, 'utf-8').substring(0, 2000);
+        }
+      }
+    } catch (_) {}
+
     const prompt = `当前刚播放完的歌曲：${currentTrack?.name || '未知'} - ${currentTrack?.artist || '未知'}
 
-候选歌单歌曲：
+最近用户对话：
+${chatSummary}
+
+最近播放历史（最近10首）：
+${historySummary}
+
+用户口味偏好：
+${tasteSummary}
+
+可选歌曲列表（共${candidates.length}首，已排除最近播放的歌曲）：
 ${candidateText}
 
-请判断下一首适合衔接的歌曲。只返回 JSON，不要输出其他文字：
-{"trackId":"候选歌曲id","reason":"一句话说明选择理由","keywords":["风格或情绪关键词"]}`;
+请综合判断用户的当前情绪和偏好，从可选歌曲列表中选择下一首最适合的歌曲。
+
+重要规则：
+1. 你必须从可选歌曲列表中选择一首歌曲
+2. 返回的 trackId 必须是列表中某首歌曲的 id
+3. 不要编造或猜测 id
+4. 尽量选择与当前歌曲风格有衔接但不完全相同的歌曲
+
+只返回 JSON，不要输出其他文字：
+{"trackId":"歌曲id","reason":"选择理由","mood":"判断的用户情绪"}`;
 
     const response = await ask(prompt, {
-      systemPrompt: '你是个人电台的选曲助手，负责从候选歌单中选择最适合自然衔接当前歌曲的下一首。'
+      systemPrompt: '你是个人电台的选曲助手，负责根据用户情绪、对话内容和播放历史，从歌曲列表中选择最契合当前氛围的下一首歌曲。'
     });
 
     const trackId = response.trackId || response.id || response.track_id;
-    const selected = candidates.find(track => track.id === trackId || track.uri === trackId);
+    const selected = candidates.find(track => track.id === trackId);
+
     if (selected) {
-      logger.info('大模型选歌成功', { track: selected.name, artist: selected.artist, reason: response.reason });
+      logger.info('大模型选歌成功', {
+        track: selected.name,
+        artist: selected.artist,
+        reason: response.reason,
+        mood: response.mood
+      });
       return selected;
     }
 
-    const keywords = Array.isArray(response.keywords) ? response.keywords.join(' ') : String(response.keywords || response.reason || '');
-    const keywordSelected = findTrackByKeywords(candidates, keywords);
-    if (keywordSelected) {
-      logger.info('大模型关键词选歌成功', { track: keywordSelected.name, artist: keywordSelected.artist, keywords });
-      return keywordSelected;
-    }
-
-    logger.warn('大模型选歌结果未命中候选歌曲，随机降级', { trackId, keywords });
+    // LLM 返回的 trackId 不在列表中，随机降级
+    logger.warn('大模型选歌结果未命中歌曲列表，随机降级', { trackId, reason: response.reason });
   } catch (e) {
-    logger.warn('大模型选歌失败，歌单内随机降级', { error: e.message, playlistId });
+    logger.warn('大模型选歌失败，随机降级', { error: e.message, playlistId });
   }
 
-  // 3. 降级：歌单内随机选
+  // 4. 降级：随机选歌
   const pick = candidates[Math.floor(Math.random() * candidates.length)];
-  logger.info('歌单内随机选歌', { playlistId, picked: pick.name });
+  logger.info('随机选歌', { playlistId, picked: pick.name });
   return pick;
-}
-
-function findTrackByKeywords(tracks, keywords) {
-  const terms = String(keywords || '')
-    .toLowerCase()
-    .split(/[\s,，、/|]+/)
-    .map(term => term.trim())
-    .filter(term => term.length >= 2);
-
-  if (terms.length === 0) return null;
-
-  let bestTrack = null;
-  let bestScore = 0;
-  for (const track of tracks) {
-    const haystack = `${track.name} ${track.artist} ${track.album || ''}`.toLowerCase();
-    const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0);
-    if (score > bestScore) {
-      bestScore = score;
-      bestTrack = track;
-    }
-  }
-
-  return bestTrack;
 }
 
 // Spotify 播放控制（next/previous 共享逻辑）
@@ -590,7 +865,7 @@ async function spotifyPlaybackControl(token, action) {
   const endpoint = action === 'next' ? getNextTrack() : getPreviousTrack();
   if (!endpoint?.uri) return { track: null, success: false };
 
-  const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+  const response = await fetchWithRetry(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
     method: 'PUT',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ uris: [endpoint.uri] })
@@ -611,6 +886,19 @@ function getTokenScopes(token) {
 }
 
 // 内部函数：获取用户token
+async function refreshWeatherInBackground() {
+  try {
+    const weatherData = await getWeather();
+    lastWeather = weatherData.tempC !== null
+      ? `${weatherData.city} ${weatherData.tempC}°C，${weatherData.condition}`
+      : '';
+    lastWeatherTime = Date.now();
+    logger.info('启动天气读取完成', { weather: lastWeather || weatherData.condition });
+  } catch (e) {
+    logger.warn('启动天气读取失败', { error: e.message });
+  }
+}
+
 async function getUserToken() {
   if (userAccessToken && Date.now() < userTokenExpiry) {
     return userAccessToken;
@@ -816,15 +1104,38 @@ async function handleMusic(payload) {
 async function handleLLM(payload) {
   const { text } = payload;
   const recentHistory = getRecentPlays(5);
-  const envContext = { time: new Date().toLocaleTimeString('zh-CN') };
+
+  // 获取天气数据
+  const weatherData = await getWeather();
+  const weatherStr = weatherData.tempC !== null
+    ? `${weatherData.city} ${weatherData.tempC}°C，${weatherData.condition}`
+    : '天气未配置';
+
+  const envContext = {
+    time: new Date().toLocaleTimeString('zh-CN'),
+    weather: weatherStr,
+  };
   const { systemPrompt } = buildContext(text, envContext, recentHistory);
 
-  const response = await ask(text, { systemPrompt });
+  // 使用 brain.compute() 获取结构化动作
+  const prompt = `${systemPrompt}\n\n用户输入：${text}`;
+  const action = await compute(prompt);
 
-  saveMessage('assistant', JSON.stringify(response));
+  logger.info('brain.compute 返回', { say: action.say?.substring(0, 50), hasPlay: !!action.play });
+
+  // 保存消息
+  saveMessage('assistant', JSON.stringify(action));
+
+  // 构建响应对象
+  const response = {
+    response_type: 'speak',
+    speech: action.say || action.segue || '',
+    should_speak: true,
+    reason: action.reason || '',
+  };
 
   // TTS 集成
-  if (response.speech && response.should_speak !== false) {
+  if (response.speech) {
     try {
       response.ttsAudioUrl = await tts.generate(response.speech);
     } catch (e) {
@@ -832,15 +1143,31 @@ async function handleLLM(payload) {
     }
   }
 
-  if (response.actions) {
-    for (const action of response.actions) {
-      if (action.type === 'play' && action.track_id) {
-        const tracks = await searchTracks(action.query || action.track_id);
-        if (tracks.length > 0) {
-          savePlay(tracks[0]);
-        }
-      }
+  // 处理 play 动作
+  if (action.play) {
+    let tracks = [];
+    if (typeof action.play === 'string') {
+      tracks = await searchTracks(action.play);
+    } else if (action.play.query) {
+      tracks = await searchTracks(action.play.query);
+    } else if (action.play.trackId) {
+      tracks = await searchTracks(action.play.trackId);
     }
+
+    if (tracks.length > 0) {
+      savePlay(tracks[0]);
+      response.track = {
+        name: tracks[0].name,
+        artist: tracks[0].artist,
+        albumArt: tracks[0].albumArt,
+        uri: tracks[0].uri,
+      };
+    }
+  }
+
+  // 处理 plan 动作
+  if (action.plan) {
+    response.plan = action.plan;
   }
 
   return response;
@@ -850,6 +1177,7 @@ async function main() {
   await initDb();
   clearMessages();
   clearPlayHistory();
+  refreshWeatherInBackground();
 
   app.listen(config.app.port, () => {
     const url = `http://localhost:${config.app.port}`;

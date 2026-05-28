@@ -15,12 +15,11 @@ export async function ask(prompt, context) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+        'api-key': apiKey,
       },
       body: JSON.stringify({
         model,
         max_tokens: 1024,
-        thinking: { type: 'disabled' },
         messages: [
           { role: 'system', content: context.systemPrompt },
           { role: 'user', content: prompt }

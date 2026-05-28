@@ -64,14 +64,6 @@ export class TTSPipeline {
 
       logger.info('TTS音频生成完成', { file: filePath, text: text.substring(0, 30) });
 
-      setTimeout(() => {
-        try {
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-          }
-        } catch (e) { }
-      }, 5 * 60 * 1000);
-
       return `/audio/${filename}`;
     } catch (error) {
       logger.error('TTS生成失败', { error: error.message });
